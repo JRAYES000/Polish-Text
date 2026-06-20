@@ -54,6 +54,24 @@ geo = main.compute_window_geometry(780, 640, True)
 check("renvoie une géométrie Tk valide",
       bool(re.match(r"^\d+x\d+(\+-?\d+\+-?\d+)?$", geo)))
 
+print("== Libellé preset (raccourci affiché) ==")
+check("affiche le raccourci",
+      main.PreviewWindow._preset_label({"name": "Reformuler", "hotkey": "alt+q"})
+      .endswith("alt+q"))
+check("sans raccourci -> nom seul",
+      main.PreviewWindow._preset_label({"name": "X", "hotkey": ""}) == "X")
+
+print("== Streaming ==")
+import inspect
+check("stream_openrouter est un générateur",
+      inspect.isgeneratorfunction(main.stream_openrouter))
+
+print("== Thème ==")
+check("palette claire et sombre définies",
+      "light" in main.PALETTES and "dark" in main.PALETTES)
+check("get_palette défaut = clair",
+      main.get_palette({}) is main.PALETTES["light"])
+
 print()
 if failures:
     print(f"ÉCHEC : {len(failures)} test(s) en échec -> {failures}")

@@ -59,7 +59,7 @@ OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 # --- Version & mise à jour automatique ---------------------------------------
 # Dépôt GitHub utilisé pour les mises à jour (modifiable aussi dans
 # Paramètres → Dépôt GitHub, sans recompiler).
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.3.0"
 GITHUB_REPO = "JRAYES000/Polish-Text"
 GITHUB_API_LATEST = "https://api.github.com/repos/{repo}/releases/latest"
 
@@ -89,6 +89,7 @@ DEFAULT_CONFIG = {
     # Le raccourci global historique sert maintenant de raccourci pour le 1er
     # preset (voir migration dans load_config). Chaque preset a son raccourci.
     "window_second_left": True,
+    "theme": "light",  # "light" ou "dark"
     "known_models": [
         "qwen/qwen3-235b-a22b-2507",
         "qwen/qwen3-next-80b-a3b-instruct",
@@ -487,6 +488,46 @@ def _friendly_openrouter_error(status, text):
     return f"Erreur OpenRouter {status} : {text[:300]}"
 
 
+def stream_openrouter(api_key, model, instruction, user_text, timeout=120):
+    """Générateur : émet le texte de la réponse au fur et à mesure (streaming
+    SSE d'OpenRouter). Lève RuntimeError avec un message clair en cas d'erreur."""
+    if not api_key:
+        raise RuntimeError("Aucune clé API OpenRouter n'est configurée "
+                           "(Paramètres → Clé API).")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://localhost/textenhancer",
+        "X-Title": APP_NAME,
+    }
+    payload = {
+        "model": model,
+        "stream": True,
+        "messages": [
+            {"role": "system", "content": instruction},
+            {"role": "user", "content": user_text},
+        ],
+    }
+    with requests.post(OPENROUTER_URL, headers=headers, json=payload,
+                       stream=True, timeout=timeout) as resp:
+        if resp.status_code != 200:
+            raise RuntimeError(
+                _friendly_openrouter_error(resp.status_code, resp.text))
+        for raw in resp.iter_lines(decode_unicode=True):
+            if not raw or not raw.startswith("data:"):
+                continue
+            data = raw[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                obj = json.loads(data)
+                delta = obj["choices"][0]["delta"].get("content")
+            except (KeyError, IndexError, ValueError):
+                continue
+            if delta:
+                yield delta
+
+
 def fetch_models(api_key, timeout=30):
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     resp = requests.get(OPENROUTER_MODELS_URL, headers=headers, timeout=timeout)
@@ -609,6 +650,95 @@ def download_and_apply_update(asset_url):
 
 
 # =============================================================================
+#  Thème (clair / sombre)
+# =============================================================================
+PALETTES = {
+    "light": {
+        "bg": "#f4f5f7", "surface": "#ffffff", "fg": "#1f2430",
+        "muted": "#6b7280", "field_bg": "#ffffff", "field_fg": "#1f2430",
+        "accent": "#2563eb", "accent_fg": "#ffffff",
+        "select_bg": "#dbeafe", "border": "#d6d9de",
+    },
+    "dark": {
+        "bg": "#1e2128", "surface": "#262a33", "fg": "#e6e8ec",
+        "muted": "#9aa0ab", "field_bg": "#2f343d", "field_fg": "#e6e8ec",
+        "accent": "#4f8cff", "accent_fg": "#0b0d10",
+        "select_bg": "#34405a", "border": "#3a3f4a",
+    },
+}
+
+
+def get_palette(cfg):
+    return PALETTES.get(cfg.get("theme", "light"), PALETTES["light"])
+
+
+def apply_theme(root, style, pal):
+    """Applique la palette aux styles ttk (thème 'clam' recolorable) et aux
+    listes déroulantes des Combobox."""
+    try:
+        style.theme_use("clam")
+    except Exception:
+        pass
+    style.configure(".", background=pal["bg"], foreground=pal["fg"],
+                    fieldbackground=pal["field_bg"], bordercolor=pal["border"])
+    style.configure("TFrame", background=pal["bg"])
+    style.configure("TLabelframe", background=pal["bg"], bordercolor=pal["border"])
+    style.configure("TLabelframe.Label", background=pal["bg"],
+                    foreground=pal["fg"])
+    style.configure("TLabel", background=pal["bg"], foreground=pal["fg"])
+    style.configure("Muted.TLabel", background=pal["bg"], foreground=pal["muted"])
+    style.configure("Status.TLabel", background=pal["bg"], foreground=pal["accent"])
+    style.configure("Toast.TLabel", background=pal["accent"],
+                    foreground=pal["accent_fg"], padding=6)
+    style.configure("TButton", background=pal["surface"], foreground=pal["fg"],
+                    bordercolor=pal["border"], padding=6)
+    style.map("TButton", background=[("active", pal["select_bg"]),
+                                     ("pressed", pal["select_bg"])])
+    style.configure("Accent.TButton", background=pal["accent"],
+                    foreground=pal["accent_fg"])
+    style.map("Accent.TButton", background=[("active", pal["accent"]),
+                                            ("pressed", pal["accent"])])
+    style.configure("TCheckbutton", background=pal["bg"], foreground=pal["fg"])
+    style.map("TCheckbutton", background=[("active", pal["bg"])])
+    style.configure("TNotebook", background=pal["bg"], bordercolor=pal["border"])
+    style.configure("TNotebook.Tab", background=pal["surface"],
+                    foreground=pal["fg"], padding=(12, 6))
+    style.map("TNotebook.Tab", background=[("selected", pal["bg"])],
+              foreground=[("selected", pal["accent"])])
+    style.configure("TCombobox", fieldbackground=pal["field_bg"],
+                    background=pal["surface"], foreground=pal["field_fg"],
+                    bordercolor=pal["border"], arrowcolor=pal["fg"])
+    style.map("TCombobox", fieldbackground=[("readonly", pal["field_bg"])],
+              foreground=[("readonly", pal["field_fg"])])
+    style.configure("TEntry", fieldbackground=pal["field_bg"],
+                    foreground=pal["field_fg"], bordercolor=pal["border"],
+                    insertcolor=pal["fg"])
+    style.configure("Vertical.TScrollbar", background=pal["surface"],
+                    troughcolor=pal["bg"], bordercolor=pal["border"],
+                    arrowcolor=pal["fg"])
+    style.configure("TPanedwindow", background=pal["bg"])
+    for opt, key in (("background", "field_bg"), ("foreground", "field_fg"),
+                     ("selectBackground", "select_bg"),
+                     ("selectForeground", "fg")):
+        try:
+            root.option_add(f"*TCombobox*Listbox.{opt}", pal[key])
+        except Exception:
+            pass
+
+
+def style_text_widget(widget, pal):
+    """Colore un tk.Text ou tk.Listbox selon la palette."""
+    try:
+        widget.configure(background=pal["field_bg"], foreground=pal["field_fg"],
+                         insertbackground=pal["fg"],
+                         selectbackground=pal["select_bg"],
+                         highlightthickness=1, highlightbackground=pal["border"],
+                         highlightcolor=pal["accent"], relief="flat", borderwidth=0)
+    except Exception:
+        pass
+
+
+# =============================================================================
 #  Application (gère le root Tk caché, l'icône tray, le hotkey)
 # =============================================================================
 class TextEnhancerApp:
@@ -621,13 +751,28 @@ class TextEnhancerApp:
         self.hotkey_ok = True
         self.hotkey_errors = []
         self.registered_count = 0
+        self.history = []          # derniers résultats (en mémoire, session)
+        self.history_max = 15
 
         # Root Tk caché : toutes les fenêtres en sont des Toplevel.
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.title(APP_NAME)
 
+        self.style = ttk.Style(self.root)
+        self.palette = get_palette(self.config)
+        apply_theme(self.root, self.style, self.palette)
+
         self._register_hotkeys()
+
+    def reapply_theme(self):
+        self.palette = get_palette(self.config)
+        apply_theme(self.root, self.style, self.palette)
+
+    def add_history(self, entry):
+        """entry = dict(preset, model, source, result)."""
+        self.history.insert(0, entry)
+        del self.history[self.history_max:]
 
     # ---- Raccourcis par preset ----------------------------------------------
     def _register_hotkeys(self):
@@ -856,10 +1001,13 @@ class PreviewWindow:
     def __init__(self, app, source_text, preset_name=None):
         self.app = app
         self.cfg = app.config
+        self.pal = app.palette
         self.source_text = source_text or ""
+        self.preset_items = self.cfg["presets"]
 
         self.win = tk.Toplevel(app.root)
         self.win.title(f"{APP_NAME} — Aperçu")
+        self.win.configure(bg=self.pal["bg"])
         self.win.minsize(560, 480)
         try:
             self.win.geometry(compute_window_geometry(
@@ -873,31 +1021,36 @@ class PreviewWindow:
         self.win.attributes("-topmost", True)
         self.win.after(400, self._release_topmost)
 
-        preset_names = [p["name"] for p in self.cfg["presets"]]
-        initial = preset_name if (preset_name in preset_names) else (
-            preset_names[0] if preset_names else "")
+        labels = [self._preset_label(p) for p in self.preset_items]
+        init_idx = self._index_of_name(preset_name)
 
-        # --- Barre du haut : preset + modèle (toujours visible) ---
+        # --- Barre du haut : preset + modèle + récents (toujours visible) ---
         top = ttk.Frame(self.win, padding=(10, 8))
         top.pack(side="top", fill="x")
         ttk.Label(top, text="Style :").grid(row=0, column=0, sticky="w")
-        self.preset_var = tk.StringVar(value=initial)
+        self.preset_var = tk.StringVar(value=labels[init_idx] if labels else "")
         self.preset_cb = ttk.Combobox(top, textvariable=self.preset_var,
-                                      values=preset_names, state="readonly",
-                                      width=28)
+                                      values=labels, state="readonly", width=30)
         self.preset_cb.grid(row=0, column=1, sticky="w", padx=(4, 16))
+        if labels:
+            self.preset_cb.current(init_idx)
+        self.preset_cb.bind("<<ComboboxSelected>>", self._on_preset_change)
+
         ttk.Label(top, text="Modèle :").grid(row=0, column=2, sticky="w")
-        self.model_var = tk.StringVar(value=self.cfg.get("default_model", ""))
+        self.model_var = tk.StringVar()
         self.model_cb = ttk.Combobox(top, textvariable=self.model_var,
                                      values=self.cfg.get("known_models", []),
-                                     width=26)
-        self.model_cb.grid(row=0, column=3, sticky="w", padx=(4, 0))
+                                     width=24)
+        self.model_cb.grid(row=0, column=3, sticky="w", padx=(4, 16))
+        ttk.Button(top, text="Récents ▾", command=self._open_recents).grid(
+            row=0, column=4, sticky="e")
+        top.columnconfigure(4, weight=1)
 
         # --- Barre de boutons : packée AVANT le centre -> TOUJOURS visible ---
         btns = ttk.Frame(self.win, padding=(10, 8))
         btns.pack(side="bottom", fill="x")
         self.gen_btn = ttk.Button(btns, text="Générer / Regénérer",
-                                  command=self.generate)
+                                  style="Accent.TButton", command=self.generate)
         self.gen_btn.pack(side="left")
         ttk.Button(btns, text="Coller (texte enrichi)",
                    command=lambda: self.paste(rich=True)).pack(side="left", padx=6)
@@ -909,7 +1062,7 @@ class PreviewWindow:
                    command=self.win.destroy).pack(side="right")
 
         self.status_var = tk.StringVar(value="")
-        ttk.Label(self.win, textvariable=self.status_var, foreground="#2563eb",
+        ttk.Label(self.win, textvariable=self.status_var, style="Status.TLabel",
                   padding=(12, 0)).pack(side="bottom", fill="x")
 
         # --- Zone centrale redimensionnable : on tire le séparateur (sash) ---
@@ -932,6 +1085,7 @@ class PreviewWindow:
         self.src_text.pack(side="left", fill="both", expand=True)
         self.src_text.insert("1.0", self.source_text)
         self.src_text.configure(state="disabled")
+        style_text_widget(self.src_text, self.pal)
 
         rwrap = ttk.Frame(res_frame)
         rwrap.pack(fill="both", expand=True)
@@ -941,6 +1095,7 @@ class PreviewWindow:
         self.result_text.configure(yscrollcommand=rscroll.set)
         rscroll.pack(side="right", fill="y")
         self.result_text.pack(side="left", fill="both", expand=True)
+        style_text_widget(self.result_text, self.pal)
 
         # Tag « gras » pour l'affichage en mise en forme réelle.
         try:
@@ -951,6 +1106,7 @@ class PreviewWindow:
         bold_font.configure(weight="bold")
         self.result_text.tag_configure("bold", font=bold_font)
 
+        self._refresh_model_for_preset()
         self.win.bind("<Escape>", lambda e: self.win.destroy())
 
         if self.source_text.strip():
@@ -959,6 +1115,43 @@ class PreviewWindow:
             self.status_var.set("Aucun texte capturé. Sélectionne du texte "
                                 "(Ctrl+C) puis le raccourci du preset.")
 
+    # ---- Helpers presets ----------------------------------------------------
+    @staticmethod
+    def _preset_label(p):
+        hk = (p.get("hotkey") or "").strip()
+        return f"{p['name']}  —  {hk}" if hk else p["name"]
+
+    def _index_of_name(self, name):
+        if name:
+            for i, p in enumerate(self.preset_items):
+                if p["name"] == name:
+                    return i
+        return 0
+
+    def _current_preset(self):
+        idx = self.preset_cb.current()
+        if 0 <= idx < len(self.preset_items):
+            return self.preset_items[idx]
+        return self.preset_items[0] if self.preset_items else {
+            "name": "", "instruction": "", "model": ""}
+
+    def _refresh_model_for_preset(self):
+        """Met le modèle de l'aperçu sur celui du preset (sinon défaut)."""
+        p = self._current_preset()
+        model = (p.get("model") or "").strip() or self.cfg.get("default_model", "")
+        self.model_var.set(model)
+
+    def _on_preset_change(self, *_):
+        self._refresh_model_for_preset()
+
+    def _select_preset(self, name):
+        idx = self._index_of_name(name)
+        labels = [self._preset_label(p) for p in self.preset_items]
+        if labels:
+            self.preset_cb.configure(values=labels)
+            self.preset_cb.current(idx)
+            self._refresh_model_for_preset()
+
     def _release_topmost(self):
         try:
             if self.win.winfo_exists():
@@ -966,11 +1159,33 @@ class PreviewWindow:
         except Exception:
             pass
 
-    def _select_preset(self, name):
-        names = [p["name"] for p in self.cfg["presets"]]
-        if name and name in names:
-            self.preset_var.set(name)
+    # ---- Récents ------------------------------------------------------------
+    def _open_recents(self):
+        menu = tk.Menu(self.win, tearoff=0)
+        if not self.app.history:
+            menu.add_command(label="(aucun résultat récent)", state="disabled")
+        else:
+            for h in self.app.history:
+                src = " ".join((h.get("source") or "").split())
+                label = f"{h.get('preset', '?')} · {src[:45]}…"
+                menu.add_command(label=label,
+                                 command=lambda e=h: self._load_history(e))
+        try:
+            menu.tk_popup(self.win.winfo_pointerx(), self.win.winfo_pointery())
+        finally:
+            menu.grab_release()
 
+    def _load_history(self, entry):
+        self._select_preset(entry.get("preset"))
+        self.source_text = entry.get("source", "")
+        self.src_text.configure(state="normal")
+        self.src_text.delete("1.0", "end")
+        self.src_text.insert("1.0", self.source_text)
+        self.src_text.configure(state="disabled")
+        render_markup_into(self.result_text, entry.get("result", ""))
+        self.status_var.set("Résultat récent chargé.")
+
+    # ---- Source / génération ------------------------------------------------
     def set_source(self, text, preset_name=None):
         if preset_name:
             self._select_preset(preset_name)
@@ -982,39 +1197,56 @@ class PreviewWindow:
         if self.source_text.strip():
             self.generate()
 
-    def _current_instruction(self):
-        name = self.preset_var.get()
-        for p in self.cfg["presets"]:
-            if p["name"] == name:
-                return p["instruction"]
-        return self.cfg["presets"][0]["instruction"]
-
     def generate(self):
         if not self.source_text.strip():
             self.status_var.set("Aucun texte à traiter.")
             return
-        self.gen_btn.configure(state="disabled")
-        self.status_var.set("Génération en cours…")
-        instruction = self._current_instruction()
+        preset = self._current_preset()
+        instruction = preset.get("instruction", "")
+        preset_name = preset.get("name", "")
         model = self.model_var.get().strip() or self.cfg.get("default_model")
         api_key = self.cfg.get("api_key", "")
         src = self.source_text
 
+        self.gen_btn.configure(state="disabled")
+        self.status_var.set("Génération en cours…")
+        self.result_text.configure(state="normal")
+        self.result_text.delete("1.0", "end")
+
         def worker():
             try:
-                result = call_openrouter(api_key, model, instruction, src)
-                self.win.after(0, lambda: self._show_result(result))
+                acc = []
+                for chunk in stream_openrouter(api_key, model, instruction, src):
+                    acc.append(chunk)
+                    piece = chunk
+                    self._safe_after(lambda c=piece: self._stream_append(c))
+                full = "".join(acc).strip()
+                self._safe_after(lambda: self._stream_done(
+                    full, preset_name, model, src))
             except Exception as e:
                 msg = str(e)
-                self.win.after(0, lambda: self._show_error(msg))
+                self._safe_after(lambda: self._show_error(msg))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _show_result(self, result):
-        render_markup_into(self.result_text, result)
+    def _safe_after(self, fn):
+        try:
+            self.win.after(0, fn)
+        except Exception:
+            pass
+
+    def _stream_append(self, chunk):
+        self.result_text.insert("end", chunk)
+        self.result_text.see("end")
+
+    def _stream_done(self, full, preset_name, model, src):
+        render_markup_into(self.result_text, full)
         self.status_var.set("Prêt. Le gras est réel : « Coller (texte enrichi) » "
                             "pour Word/Outlook.")
         self.gen_btn.configure(state="normal")
+        if full:
+            self.app.add_history({"preset": preset_name, "model": model,
+                                  "source": src, "result": full})
 
     def _show_error(self, msg):
         self.result_text.configure(state="normal")
@@ -1028,12 +1260,21 @@ class PreviewWindow:
     def _result_html(self):
         return text_widget_to_html(self.result_text)
 
+    # ---- Toast --------------------------------------------------------------
+    def _toast(self, msg):
+        try:
+            t = ttk.Label(self.win, text=msg, style="Toast.TLabel")
+            t.place(relx=0.5, rely=1.0, y=-48, anchor="s")
+            self.win.after(1500, t.destroy)
+        except Exception:
+            pass
+
     def copy(self):
         if not self._result_plain().strip():
             return
         set_clipboard_html(self._result_html(), self._result_plain())
-        self.status_var.set("Copié (texte enrichi). Colle avec Ctrl+V dans "
-                            "Word/Outlook.")
+        self.status_var.set("Copié (texte enrichi).")
+        self._toast("Copié ✓")
 
     def paste(self, rich=True):
         if not self._result_plain().strip():
@@ -1057,7 +1298,8 @@ class SettingsWindow:
 
         self.win = tk.Toplevel(app.root)
         self.win.title(f"{APP_NAME} — Paramètres")
-        self.win.geometry("760x620")
+        self.win.configure(bg=app.palette["bg"])
+        self.win.geometry("760x660")
         self.win.lift()
         self.win.focus_force()
         self.win.attributes("-topmost", True)
@@ -1106,36 +1348,43 @@ class SettingsWindow:
                    command=self._refresh_models).grid(row=1, column=2, padx=6)
 
         ttk.Label(f, text="Les raccourcis clavier se règlent par preset "
-                  "(onglet « Presets »).", foreground="#666").grid(
+                  "(onglet « Presets »).", style="Muted.TLabel").grid(
             row=2, column=1, sticky="w", pady=(6, 2))
+
+        self.dark_var = tk.BooleanVar(
+            value=self.cfg.get("theme", "light") == "dark")
+        ttk.Checkbutton(f, text="Mode sombre",
+                        variable=self.dark_var).grid(
+            row=3, column=1, sticky="w", pady=(4, 2))
 
         self.second_left_var = tk.BooleanVar(
             value=self.cfg.get("window_second_left", True))
         ttk.Checkbutton(
             f, text="Afficher la fenêtre sur le 2e écran (moitié gauche)",
             variable=self.second_left_var).grid(
-            row=3, column=1, sticky="w", pady=(4, 2))
+            row=4, column=1, sticky="w", pady=(4, 2))
 
         self.startup_var = tk.BooleanVar(value=is_startup_enabled())
         ttk.Checkbutton(f, text="Lancer au démarrage de Windows",
                         variable=self.startup_var).grid(
-            row=4, column=1, sticky="w", pady=(4, 2))
+            row=5, column=1, sticky="w", pady=(4, 2))
 
-        ttk.Label(f, text="Dépôt GitHub :").grid(row=5, column=0, sticky="w", pady=4)
+        ttk.Label(f, text="Dépôt GitHub :").grid(row=6, column=0, sticky="w", pady=4)
         self.repo_var = tk.StringVar(value=self.cfg.get("github_repo", ""))
         ttk.Entry(f, textvariable=self.repo_var, width=40).grid(
-            row=5, column=1, sticky="w", pady=4)
+            row=6, column=1, sticky="w", pady=4)
         ttk.Label(f, text="(ex : ton-pseudo/text-enhancer-ai — pour les mises à jour)",
-                  foreground="#666").grid(row=6, column=1, sticky="w")
+                  style="Muted.TLabel").grid(row=7, column=1, sticky="w")
 
         self.updcheck_var = tk.BooleanVar(
             value=self.cfg.get("check_updates_on_start", True))
         ttk.Checkbutton(f, text="Vérifier les mises à jour au démarrage",
                         variable=self.updcheck_var).grid(
-            row=7, column=1, sticky="w", pady=(8, 2))
+            row=8, column=1, sticky="w", pady=(8, 2))
 
         ttk.Label(f, text=f"Version installée : {APP_VERSION}",
-                  foreground="#666").grid(row=8, column=1, sticky="w", pady=(8, 0))
+                  style="Muted.TLabel").grid(row=9, column=1, sticky="w",
+                                             pady=(8, 0))
 
     def _toggle_key(self):
         self.api_entry.configure(show="" if self.show_key.get() else "•")
@@ -1158,11 +1407,20 @@ class SettingsWindow:
         f = ttk.Frame(nb, padding=12)
         nb.add(f, text="Presets (instructions)")
 
+        pal = self.app.palette
         left = ttk.Frame(f)
         left.pack(side="left", fill="y", padx=(0, 10))
-        self.preset_list = tk.Listbox(left, width=28, height=18,
+        self.preset_list = tk.Listbox(left, width=26, height=18,
                                       exportselection=False)
         self.preset_list.pack(fill="y", expand=True)
+        try:
+            self.preset_list.configure(
+                background=pal["field_bg"], foreground=pal["field_fg"],
+                selectbackground=pal["select_bg"], selectforeground=pal["fg"],
+                highlightthickness=1, highlightbackground=pal["border"],
+                relief="flat", borderwidth=0)
+        except Exception:
+            pass
         self.preset_list.bind("<<ListboxSelect>>", self._on_select_preset)
         btnf = ttk.Frame(left)
         btnf.pack(fill="x", pady=4)
@@ -1177,14 +1435,29 @@ class SettingsWindow:
         self.name_var = tk.StringVar()
         ttk.Entry(right, textvariable=self.name_var, width=50).pack(
             anchor="w", fill="x")
-        ttk.Label(right, text="Raccourci clavier (ex : alt+q, ctrl+alt+r) — "
-                  "laisser vide pour aucun :").pack(anchor="w", pady=(8, 0))
+
+        ttk.Label(right, text="Raccourci clavier (vide = aucun) :").pack(
+            anchor="w", pady=(8, 0))
+        hkrow = ttk.Frame(right)
+        hkrow.pack(anchor="w", fill="x")
         self.hotkey_var = tk.StringVar()
-        ttk.Entry(right, textvariable=self.hotkey_var, width=24).pack(anchor="w")
+        ttk.Entry(hkrow, textvariable=self.hotkey_var, width=20).pack(side="left")
+        self.capture_btn = ttk.Button(hkrow, text="Définir…",
+                                      command=self._capture_hotkey)
+        self.capture_btn.pack(side="left", padx=6)
+
+        ttk.Label(right, text="Modèle (vide = modèle par défaut) :").pack(
+            anchor="w", pady=(8, 0))
+        self.preset_model_var = tk.StringVar()
+        ttk.Combobox(right, textvariable=self.preset_model_var,
+                     values=self.cfg.get("known_models", []), width=40).pack(
+            anchor="w")
+
         ttk.Label(right, text="Instruction (prompt système) :").pack(
             anchor="w", pady=(8, 0))
-        self.instr_text = tk.Text(right, wrap="word", height=16)
+        self.instr_text = tk.Text(right, wrap="word", height=13)
         self.instr_text.pack(fill="both", expand=True)
+        style_text_widget(self.instr_text, pal)
         ttk.Button(right, text="Mettre à jour ce preset",
                    command=self._apply_preset_edit).pack(anchor="e", pady=6)
 
@@ -1210,6 +1483,7 @@ class SettingsWindow:
             return
         self.name_var.set(self.presets[i]["name"])
         self.hotkey_var.set(self.presets[i].get("hotkey", ""))
+        self.preset_model_var.set(self.presets[i].get("model", ""))
         self.instr_text.delete("1.0", "end")
         self.instr_text.insert("1.0", self.presets[i]["instruction"])
 
@@ -1219,12 +1493,42 @@ class SettingsWindow:
             return
         self.presets[i]["name"] = self.name_var.get().strip() or "Sans nom"
         self.presets[i]["hotkey"] = self.hotkey_var.get().strip().lower()
+        self.presets[i]["model"] = self.preset_model_var.get().strip()
         self.presets[i]["instruction"] = self.instr_text.get("1.0", "end-1c")
         self._reload_preset_list()
         self.preset_list.selection_set(i)
 
+    def _capture_hotkey(self):
+        """Capture la prochaine combinaison de touches pressée par l'utilisateur."""
+        self.capture_btn.configure(state="disabled", text="Pressez la combinaison…")
+
+        def worker():
+            # On désactive temporairement les raccourcis de l'app pour ne pas
+            # déclencher un preset pendant la capture.
+            try:
+                keyboard.clear_all_hotkeys()
+            except Exception:
+                pass
+            try:
+                hk = keyboard.read_hotkey(suppress=False)
+            except Exception:
+                hk = ""
+
+            def done():
+                if hk and hk.lower() != "esc":
+                    self.hotkey_var.set(hk.lower())
+                self.capture_btn.configure(state="normal", text="Définir…")
+                self.app.reload_hotkeys()  # restaure les raccourcis enregistrés
+
+            try:
+                self.win.after(0, done)
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _add_preset(self):
-        self.presets.append({"name": "Nouveau preset", "hotkey": "",
+        self.presets.append({"name": "Nouveau preset", "hotkey": "", "model": "",
                              "instruction": "Décris ici l'instruction…"})
         self._reload_preset_list()
         i = len(self.presets) - 1
@@ -1250,6 +1554,7 @@ class SettingsWindow:
         self.cfg["github_repo"] = self.repo_var.get().strip()
         self.cfg["check_updates_on_start"] = bool(self.updcheck_var.get())
         self.cfg["window_second_left"] = bool(self.second_left_var.get())
+        self.cfg["theme"] = "dark" if self.dark_var.get() else "light"
         self.cfg["presets"] = self.presets
         save_config(self.cfg)
 
@@ -1260,10 +1565,13 @@ class SettingsWindow:
                                    f"Démarrage Windows non configuré : {e}",
                                    parent=self.win)
 
-        # Les raccourcis peuvent avoir changé : on ré-enregistre toujours.
+        # Thème + raccourcis : on réapplique toujours.
         self.win.destroy()
+        self.app.reapply_theme()
         self.app.reload_hotkeys()
-        messagebox.showinfo(APP_NAME, "Paramètres enregistrés.")
+        messagebox.showinfo(APP_NAME,
+                            "Paramètres enregistrés. Le thème s'applique aux "
+                            "prochaines fenêtres ouvertes.")
 
 
 # =============================================================================
