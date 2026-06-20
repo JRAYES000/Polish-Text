@@ -54,7 +54,7 @@ OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 # --- Version & mise à jour automatique ---------------------------------------
 # Dépôt GitHub utilisé pour les mises à jour (modifiable aussi dans
 # Paramètres → Dépôt GitHub, sans recompiler).
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 GITHUB_REPO = "JRAYES000/Polish-Text"
 GITHUB_API_LATEST = "https://api.github.com/repos/{repo}/releases/latest"
 
@@ -384,8 +384,9 @@ def get_latest_release(repo, timeout=20):
 
 def download_and_apply_update(asset_url):
     """Télécharge le nouvel .exe et programme le remplacement de l'exe en cours
-    via un script batch (qui attend la fermeture du process, échange le fichier,
-    puis relance l'application)."""
+    via un script batch. Le script réessaie le remplacement en boucle jusqu'à ce
+    que l'ancien exe soit déverrouillé (donc dès que l'app est fermée), puis
+    relance l'application. Conçu pour fonctionner avec une console cachée."""
     if not getattr(sys, "frozen", False):
         raise RuntimeError("La mise à jour automatique n'est disponible que "
                            "pour l'exécutable (.exe).")
@@ -399,26 +400,40 @@ def download_and_apply_update(asset_url):
                 if chunk:
                     f.write(chunk)
 
-    pid = os.getpid()
+    # Garde-fou : un exe valide pèse plusieurs Mo.
+    if os.path.getsize(new_exe) < 1_000_000:
+        raise RuntimeError("Téléchargement de la mise à jour incomplet.")
+
+    log = os.path.join(tempfile.gettempdir(), "TextEnhancerAI_update.log")
     bat_path = os.path.join(tempfile.gettempdir(), "TextEnhancerAI_update.bat")
+    # Remarques :
+    #  - 'ping' sert de temporisation (contrairement à 'timeout', il ne dépend
+    #    pas d'une console interactive).
+    #  - On réessaie 'move' jusqu'à ce qu'il réussisse : il échoue tant que
+    #    l'ancien exe est verrouillé (app encore ouverte), puis réussit.
     script = (
         "@echo off\r\n"
-        ":waitloop\r\n"
-        f'tasklist /FI "PID eq {pid}" 2>nul | find "{pid}" >nul\r\n'
-        "if not errorlevel 1 (\r\n"
-        "  timeout /t 1 /nobreak >nul\r\n"
-        "  goto waitloop\r\n"
-        ")\r\n"
-        "timeout /t 1 /nobreak >nul\r\n"
-        f'move /y "{new_exe}" "{current_exe}" >nul\r\n'
+        f'echo [%DATE% %TIME%] debut mise a jour> "{log}"\r\n'
+        "set /a TRIES=0\r\n"
+        ":retry\r\n"
+        "ping 127.0.0.1 -n 2 >nul\r\n"
+        f'move /y "{new_exe}" "{current_exe}" >> "{log}" 2>&1\r\n'
+        f'if not exist "{new_exe}" goto done\r\n'
+        "set /a TRIES+=1\r\n"
+        "if %TRIES% LSS 60 goto retry\r\n"
+        f'echo [%DATE% %TIME%] echec apres 60 tentatives>> "{log}"\r\n'
+        "exit\r\n"
+        ":done\r\n"
+        f'echo [%DATE% %TIME%] remplacement OK, redemarrage>> "{log}"\r\n'
         f'start "" "{current_exe}"\r\n'
         'del "%~f0"\r\n'
     )
     with open(bat_path, "w", encoding="utf-8") as f:
         f.write(script)
 
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | \
-        getattr(subprocess, "DETACHED_PROCESS", 0)
+    # CREATE_NO_WINDOW : le script tourne avec une console cachée (donc 'ping',
+    # 'move' & co fonctionnent) et survit à la fermeture de l'application.
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
     subprocess.Popen(["cmd", "/c", bat_path], creationflags=creationflags,
                      close_fds=True)
 
