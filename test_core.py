@@ -43,6 +43,8 @@ m = dict(re.findall(r"(StartFragment|EndFragment):(\d+)", full))
 sf, ef = int(m["StartFragment"]), int(m["EndFragment"])
 check("StartFragment/EndFragment encadrent exactement le fragment",
       b[sf:ef].decode("utf-8") == frag)
+check("meta charset utf-8 présent (accents corrects au collage)",
+      'meta charset="utf-8"' in full)
 
 print("== Messages d'erreur OpenRouter ==")
 check("401 -> message clé", "401" in main._friendly_openrouter_error(401, ""))

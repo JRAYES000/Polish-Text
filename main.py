@@ -59,7 +59,7 @@ OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 # --- Version & mise à jour automatique ---------------------------------------
 # Dépôt GitHub utilisé pour les mises à jour (modifiable aussi dans
 # Paramètres → Dépôt GitHub, sans recompiler).
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 GITHUB_REPO = "JRAYES000/Polish-Text"
 GITHUB_API_LATEST = "https://api.github.com/repos/{repo}/releases/latest"
 
@@ -277,7 +277,8 @@ def _build_cf_html(fragment_html):
         "StartFragment:{:09d}\r\n"
         "EndFragment:{:09d}\r\n"
     )
-    html_pre = "<html><body>\r\n<!--StartFragment-->"
+    html_pre = ('<html><head><meta charset="utf-8"></head><body>\r\n'
+                "<!--StartFragment-->")
     html_post = "<!--EndFragment-->\r\n</body></html>"
 
     header_len = len(header_tpl.format(0, 0, 0, 0).encode("utf-8"))
@@ -511,10 +512,16 @@ def stream_openrouter(api_key, model, instruction, user_text, timeout=120):
     with requests.post(OPENROUTER_URL, headers=headers, json=payload,
                        stream=True, timeout=timeout) as resp:
         if resp.status_code != 200:
+            resp.encoding = "utf-8"
             raise RuntimeError(
                 _friendly_openrouter_error(resp.status_code, resp.text))
-        for raw in resp.iter_lines(decode_unicode=True):
-            if not raw or not raw.startswith("data:"):
+        # On lit les octets bruts et on décode explicitement en UTF-8 : sans
+        # cela, requests décode en Latin-1 (charset absent) -> accents corrompus.
+        for raw_b in resp.iter_lines():
+            if not raw_b:
+                continue
+            raw = raw_b.decode("utf-8", errors="replace")
+            if not raw.startswith("data:"):
                 continue
             data = raw[5:].strip()
             if data == "[DONE]":
@@ -1004,6 +1011,7 @@ class PreviewWindow:
         self.pal = app.palette
         self.source_text = source_text or ""
         self.preset_items = self.cfg["presets"]
+        self.prompt_override = None  # instruction modifiée pour la session
 
         self.win = tk.Toplevel(app.root)
         self.win.title(f"{APP_NAME} — Aperçu")
@@ -1040,11 +1048,13 @@ class PreviewWindow:
         self.model_var = tk.StringVar()
         self.model_cb = ttk.Combobox(top, textvariable=self.model_var,
                                      values=self.cfg.get("known_models", []),
-                                     width=24)
-        self.model_cb.grid(row=0, column=3, sticky="w", padx=(4, 16))
+                                     width=22)
+        self.model_cb.grid(row=0, column=3, sticky="w", padx=(4, 12))
+        top.columnconfigure(4, weight=1)  # espaceur
+        ttk.Button(top, text="Prompt…", command=self._open_prompt_editor).grid(
+            row=0, column=5, sticky="e", padx=(0, 6))
         ttk.Button(top, text="Récents ▾", command=self._open_recents).grid(
-            row=0, column=4, sticky="e")
-        top.columnconfigure(4, weight=1)
+            row=0, column=6, sticky="e")
 
         # --- Barre de boutons : packée AVANT le centre -> TOUJOURS visible ---
         btns = ttk.Frame(self.win, padding=(10, 8))
@@ -1073,7 +1083,8 @@ class PreviewWindow:
         res_frame = ttk.LabelFrame(
             paned, text="Résultat (éditable — mise en forme réelle)", padding=6)
         paned.add(src_frame, weight=1)
-        paned.add(res_frame, weight=3)
+        paned.add(res_frame, weight=1)
+        self._paned = paned
 
         swrap = ttk.Frame(src_frame)
         swrap.pack(fill="both", expand=True)
@@ -1108,12 +1119,24 @@ class PreviewWindow:
 
         self._refresh_model_for_preset()
         self.win.bind("<Escape>", lambda e: self.win.destroy())
+        # Hauteurs égales par défaut : on place le séparateur au milieu une fois
+        # la fenêtre dimensionnée.
+        self.win.after(80, self._equalize_panes)
 
         if self.source_text.strip():
             self.win.after(150, self.generate)
         else:
             self.status_var.set("Aucun texte capturé. Sélectionne du texte "
                                 "(Ctrl+C) puis le raccourci du preset.")
+
+    def _equalize_panes(self):
+        try:
+            self._paned.update_idletasks()
+            h = self._paned.winfo_height()
+            if h > 1:
+                self._paned.sashpos(0, h // 2)
+        except Exception:
+            pass
 
     # ---- Helpers presets ----------------------------------------------------
     @staticmethod
@@ -1142,6 +1165,7 @@ class PreviewWindow:
         self.model_var.set(model)
 
     def _on_preset_change(self, *_):
+        self.prompt_override = None  # le prompt modifié était lié au preset
         self._refresh_model_for_preset()
 
     def _select_preset(self, name):
@@ -1150,6 +1174,7 @@ class PreviewWindow:
         if labels:
             self.preset_cb.configure(values=labels)
             self.preset_cb.current(idx)
+            self.prompt_override = None
             self._refresh_model_for_preset()
 
     def _release_topmost(self):
@@ -1158,6 +1183,62 @@ class PreviewWindow:
                 self.win.attributes("-topmost", False)
         except Exception:
             pass
+
+    # ---- Édition du prompt --------------------------------------------------
+    def _open_prompt_editor(self):
+        preset = self._current_preset()
+        idx = self.preset_cb.current()
+        ed = tk.Toplevel(self.win)
+        ed.title("Prompt du style")
+        ed.configure(bg=self.pal["bg"])
+        ed.geometry("580x440")
+        ed.transient(self.win)
+        ed.lift()
+        ed.focus_force()
+        ttk.Label(ed, text=f"Instruction (prompt système) pour « "
+                  f"{preset.get('name', '')} » :", padding=(10, 8)).pack(anchor="w")
+        wrap = ttk.Frame(ed, padding=(10, 0))
+        wrap.pack(fill="both", expand=True)
+        txt = tk.Text(wrap, wrap="word")
+        sc = ttk.Scrollbar(wrap, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=sc.set)
+        sc.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
+        style_text_widget(txt, self.pal)
+        txt.insert("1.0", self.prompt_override or preset.get("instruction", ""))
+
+        info = ttk.Label(ed, style="Muted.TLabel", padding=(10, 4),
+                         text="« Appliquer » : pour cette session. "
+                              "« Enregistrer » : modifie le preset durablement.")
+        info.pack(anchor="w")
+        bar = ttk.Frame(ed, padding=10)
+        bar.pack(fill="x")
+
+        def apply_session():
+            self.prompt_override = txt.get("1.0", "end-1c")
+            ed.destroy()
+            self.status_var.set("Prompt modifié (session). Régénération…")
+            self.generate()
+
+        def save_to_preset():
+            new_instr = txt.get("1.0", "end-1c")
+            if 0 <= idx < len(self.preset_items):
+                self.preset_items[idx]["instruction"] = new_instr
+                self.cfg["presets"] = self.preset_items
+                try:
+                    save_config(self.cfg)
+                except Exception:
+                    pass
+            self.prompt_override = None
+            ed.destroy()
+            self.status_var.set("Prompt enregistré dans le preset. Régénération…")
+            self.generate()
+
+        ttk.Button(bar, text="Appliquer (session)", style="Accent.TButton",
+                   command=apply_session).pack(side="left")
+        ttk.Button(bar, text="Enregistrer dans le preset",
+                   command=save_to_preset).pack(side="left", padx=6)
+        ttk.Button(bar, text="Annuler", command=ed.destroy).pack(side="right")
 
     # ---- Récents ------------------------------------------------------------
     def _open_recents(self):
@@ -1202,7 +1283,7 @@ class PreviewWindow:
             self.status_var.set("Aucun texte à traiter.")
             return
         preset = self._current_preset()
-        instruction = preset.get("instruction", "")
+        instruction = self.prompt_override or preset.get("instruction", "")
         preset_name = preset.get("name", "")
         model = self.model_var.get().strip() or self.cfg.get("default_model")
         api_key = self.cfg.get("api_key", "")
