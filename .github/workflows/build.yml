@@ -31,6 +31,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
+      - name: Lancer les tests (bloque le build si échec)
+        run: python test_core.py
+
       - name: Compiler l'exécutable
         run: pyinstaller --noconfirm --onefile --windowed --name TextEnhancerAI main.py
 

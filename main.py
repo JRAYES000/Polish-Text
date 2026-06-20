@@ -28,11 +28,12 @@ import traceback
 import tempfile
 import subprocess
 import webbrowser
+import base64
+import shutil
 
 # --- Dépendances tierces -----------------------------------------------------
 import requests
 import keyboard                       # raccourcis globaux + simulation de touches
-import markdown as md_lib             # markdown -> HTML
 import pystray
 from PIL import Image, ImageDraw
 
@@ -45,6 +46,7 @@ import win32con
 import win32gui
 import win32event
 import win32api
+import win32crypt
 import winerror
 import winreg
 
@@ -57,7 +59,7 @@ OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 # --- Version & mise à jour automatique ---------------------------------------
 # Dépôt GitHub utilisé pour les mises à jour (modifiable aussi dans
 # Paramètres → Dépôt GitHub, sans recompiler).
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.1.0"
 GITHUB_REPO = "JRAYES000/Polish-Text"
 GITHUB_API_LATEST = "https://api.github.com/repos/{repo}/releases/latest"
 
@@ -78,16 +80,18 @@ def config_path():
 
 DEFAULT_CONFIG = {
     "api_key": "",
-    "default_model": "qwen/qwen3.7-plus",
+    # Modèle par défaut : économique et NON rate-limité (~0,10 $/M tokens en
+    # sortie), largement suffisant pour de la reformulation.
+    "default_model": "qwen/qwen3-235b-a22b-2507",
     "hotkey": "alt+q",
     "github_repo": GITHUB_REPO,
     "check_updates_on_start": True,
     "known_models": [
+        "qwen/qwen3-235b-a22b-2507",
+        "qwen/qwen3-next-80b-a3b-instruct",
         "qwen/qwen3.7-plus",
-        "anthropic/claude-opus-4.8",
         "anthropic/claude-sonnet-4.6",
         "google/gemini-2.5-flash",
-        "openai/gpt-5",
     ],
     "presets": [
         {
@@ -130,27 +134,89 @@ DEFAULT_CONFIG = {
 }
 
 
+def _encrypt_secret(text):
+    """Chiffre une chaîne via la DPAPI Windows (déchiffrable uniquement par la
+    session Windows courante). Renvoie du base64, ou '' en cas d'échec/vide."""
+    if not text:
+        return ""
+    try:
+        blob = win32crypt.CryptProtectData(text.encode("utf-8"),
+                                           "TextEnhancerAI", None, None, None, 0)
+        return base64.b64encode(blob).decode("ascii")
+    except Exception:
+        return ""
+
+
+def _decrypt_secret(b64):
+    if not b64:
+        return ""
+    try:
+        blob = base64.b64decode(b64.encode("ascii"))
+        _, data = win32crypt.CryptUnprotectData(blob, None, None, None, 0)
+        return data.decode("utf-8")
+    except Exception:
+        return ""
+
+
 def load_config():
     path = config_path()
     if not os.path.exists(path):
-        save_config(DEFAULT_CONFIG)
-        return json.loads(json.dumps(DEFAULT_CONFIG))
+        cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+        save_config(cfg)
+        return cfg
+    cfg = None
     try:
         with open(path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
     except Exception:
+        # Fichier corrompu : on tente la sauvegarde .bak.
+        bak = path + ".bak"
+        if os.path.exists(bak):
+            try:
+                with open(bak, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            except Exception:
+                cfg = None
+    if cfg is None:
         cfg = json.loads(json.dumps(DEFAULT_CONFIG))
     # Complète les clés manquantes (migrations douces)
     for k, v in DEFAULT_CONFIG.items():
         cfg.setdefault(k, v)
     if not cfg.get("presets"):
         cfg["presets"] = json.loads(json.dumps(DEFAULT_CONFIG["presets"]))
+    # Déchiffre la clé API si elle est stockée chiffrée.
+    enc = cfg.get("api_key_enc")
+    if enc:
+        dec = _decrypt_secret(enc)
+        if dec:
+            cfg["api_key"] = dec
     return cfg
 
 
 def save_config(cfg):
-    with open(config_path(), "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    """Écriture atomique (fichier temporaire puis os.replace) avec sauvegarde
+    .bak. La clé API est chiffrée (DPAPI) et n'est jamais écrite en clair."""
+    path = config_path()
+    to_save = dict(cfg)
+    enc = _encrypt_secret(cfg.get("api_key", ""))
+    to_save["api_key_enc"] = enc
+    # Si le chiffrement échoue, on conserve la clé pour ne pas la perdre.
+    to_save["api_key"] = "" if enc else cfg.get("api_key", "")
+
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(to_save, f, ensure_ascii=False, indent=2)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            pass
+    if os.path.exists(path):
+        try:
+            shutil.copy2(path, path + ".bak")
+        except Exception:
+            pass
+    os.replace(tmp, path)
 
 
 # =============================================================================
@@ -366,15 +432,48 @@ def call_openrouter(api_key, model, instruction, user_text, timeout=90):
             {"role": "user", "content": user_text},
         ],
     }
-    resp = requests.post(OPENROUTER_URL, headers=headers,
-                         json=payload, timeout=timeout)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Erreur OpenRouter {resp.status_code} : {resp.text[:500]}")
-    data = resp.json()
-    try:
-        return data["choices"][0]["message"]["content"].strip()
-    except (KeyError, IndexError):
-        raise RuntimeError(f"Réponse inattendue d'OpenRouter : {data}")
+    last_err = "Échec de l'appel à OpenRouter."
+    for attempt in range(3):
+        try:
+            resp = requests.post(OPENROUTER_URL, headers=headers,
+                                 json=payload, timeout=timeout)
+        except requests.exceptions.RequestException as e:
+            last_err = f"Problème réseau : {e}"
+            time.sleep(1.5 * (attempt + 1))
+            continue
+
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+                return data["choices"][0]["message"]["content"].strip()
+            except (KeyError, IndexError, ValueError):
+                raise RuntimeError("Réponse inattendue d'OpenRouter : "
+                                   f"{resp.text[:300]}")
+        # Erreurs transitoires : on réessaie.
+        if resp.status_code in (429, 500, 502, 503, 504):
+            last_err = _friendly_openrouter_error(resp.status_code, resp.text)
+            time.sleep(1.5 * (attempt + 1))
+            continue
+        # Erreur non récupérable : message clair immédiat.
+        raise RuntimeError(_friendly_openrouter_error(resp.status_code, resp.text))
+
+    raise RuntimeError(last_err)
+
+
+def _friendly_openrouter_error(status, text):
+    if status == 401:
+        return ("Clé API invalide ou expirée (401). Vérifie ta clé dans "
+                "Paramètres → Clé API.")
+    if status == 402:
+        return ("Crédit OpenRouter insuffisant (402). Ajoute du crédit sur "
+                "ton compte OpenRouter.")
+    if status == 429:
+        return ("Quota atteint / trop de requêtes (429). Réessaie dans un "
+                "instant, ou utilise un modèle non gratuit.")
+    if status == 404:
+        return ("Modèle introuvable (404). Vérifie l'identifiant du modèle "
+                "dans les Paramètres.")
+    return f"Erreur OpenRouter {status} : {text[:300]}"
 
 
 def fetch_models(api_key, timeout=30):
@@ -496,6 +595,8 @@ class TextEnhancerApp:
         self.preview_win = None
         self.settings_win = None
         self.icon = None
+        self.hotkey_ok = True
+        self.hotkey_error = ""
 
         # Root Tk caché : toutes les fenêtres en sont des Toplevel.
         self.root = tk.Tk()
@@ -512,9 +613,13 @@ class TextEnhancerApp:
             pass
         try:
             keyboard.add_hotkey(self.config["hotkey"], self._on_hotkey)
+            self.hotkey_ok = True
+            self.hotkey_error = ""
+            return True
         except Exception as e:
-            print(f"Impossible d'enregistrer le raccourci "
-                  f"'{self.config['hotkey']}': {e}")
+            self.hotkey_ok = False
+            self.hotkey_error = str(e)
+            return False
 
     def _on_hotkey(self):
         # Capture immédiate (l'app cible est encore au premier plan),
@@ -580,7 +685,14 @@ class TextEnhancerApp:
         self.root.after(0, self.root.destroy)
 
     def reload_hotkey(self):
-        self._register_hotkey()
+        ok = self._register_hotkey()
+        if not ok:
+            messagebox.showwarning(
+                APP_NAME,
+                f"Le raccourci « {self.config['hotkey']} » n'a pas pu être "
+                f"enregistré ({self.hotkey_error}).\n\nVérifie qu'il est valide "
+                "(ex. alt+q, ctrl+alt+r, ctrl+shift+e).")
+        return ok
 
     # ---- Mise à jour --------------------------------------------------------
     def check_updates(self, silent=True):
@@ -645,6 +757,13 @@ class TextEnhancerApp:
         if not self.config.get("api_key"):
             # Première utilisation : on ouvre directement les paramètres.
             self.root.after(500, self.open_settings)
+        if not self.hotkey_ok:
+            self.root.after(900, lambda: messagebox.showwarning(
+                APP_NAME,
+                f"Le raccourci « {self.config['hotkey']} » n'a pas pu être "
+                "enregistré. Modifie-le dans les Paramètres.\n\nTu peux aussi "
+                "utiliser « Améliorer (presse-papiers) » via l'icône de la "
+                "barre des tâches."))
         # Vérification des mises à jour au démarrage (en arrière-plan).
         if self.config.get("check_updates_on_start", True):
             self.root.after(2500, lambda: self.check_updates(silent=True))
