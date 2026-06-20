@@ -49,6 +49,11 @@ check("401 -> message clé", "401" in main._friendly_openrouter_error(401, ""))
 check("402 -> message crédit", "402" in main._friendly_openrouter_error(402, ""))
 check("429 -> message quota", "429" in main._friendly_openrouter_error(429, ""))
 
+print("== Géométrie fenêtre (placement multi-écrans) ==")
+geo = main.compute_window_geometry(780, 640, True)
+check("renvoie une géométrie Tk valide",
+      bool(re.match(r"^\d+x\d+(\+-?\d+\+-?\d+)?$", geo)))
+
 print()
 if failures:
     print(f"ÉCHEC : {len(failures)} test(s) en échec -> {failures}")

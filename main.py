@@ -59,7 +59,7 @@ OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 # --- Version & mise à jour automatique ---------------------------------------
 # Dépôt GitHub utilisé pour les mises à jour (modifiable aussi dans
 # Paramètres → Dépôt GitHub, sans recompiler).
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.2.0"
 GITHUB_REPO = "JRAYES000/Polish-Text"
 GITHUB_API_LATEST = "https://api.github.com/repos/{repo}/releases/latest"
 
@@ -86,6 +86,9 @@ DEFAULT_CONFIG = {
     "hotkey": "alt+q",
     "github_repo": GITHUB_REPO,
     "check_updates_on_start": True,
+    # Le raccourci global historique sert maintenant de raccourci pour le 1er
+    # preset (voir migration dans load_config). Chaque preset a son raccourci.
+    "window_second_left": True,
     "known_models": [
         "qwen/qwen3-235b-a22b-2507",
         "qwen/qwen3-next-80b-a3b-instruct",
@@ -96,6 +99,7 @@ DEFAULT_CONFIG = {
     "presets": [
         {
             "name": "Reformuler (clair + gras)",
+            "hotkey": "alt+q",
             "instruction": (
                 "Tu es un assistant de rédaction. Reformule le texte fourni "
                 "pour le rendre plus clair, fluide et professionnel. Structure "
@@ -184,6 +188,13 @@ def load_config():
         cfg.setdefault(k, v)
     if not cfg.get("presets"):
         cfg["presets"] = json.loads(json.dumps(DEFAULT_CONFIG["presets"]))
+    # Migration : l'ancien raccourci global unique devient le raccourci du
+    # 1er preset (si aucun preset n'en a déjà un).
+    presets = cfg.get("presets") or []
+    if presets and not any((p.get("hotkey") or "").strip() for p in presets):
+        legacy = (cfg.get("hotkey") or "").strip()
+        if legacy:
+            presets[0]["hotkey"] = legacy
     # Déchiffre la clé API si elle est stockée chiffrée.
     enc = cfg.get("api_key_enc")
     if enc:
@@ -608,45 +619,59 @@ class TextEnhancerApp:
         self.settings_win = None
         self.icon = None
         self.hotkey_ok = True
-        self.hotkey_error = ""
+        self.hotkey_errors = []
+        self.registered_count = 0
 
         # Root Tk caché : toutes les fenêtres en sont des Toplevel.
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.title(APP_NAME)
 
-        self._register_hotkey()
+        self._register_hotkeys()
 
-    # ---- Raccourci global ---------------------------------------------------
-    def _register_hotkey(self):
+    # ---- Raccourcis par preset ----------------------------------------------
+    def _register_hotkeys(self):
+        """Enregistre un raccourci global par preset qui en possède un."""
         try:
             keyboard.clear_all_hotkeys()
         except Exception:
             pass
-        try:
-            keyboard.add_hotkey(self.config["hotkey"], self._on_hotkey)
-            self.hotkey_ok = True
-            self.hotkey_error = ""
-            return True
-        except Exception as e:
-            self.hotkey_ok = False
-            self.hotkey_error = str(e)
-            return False
+        self.hotkey_errors = []
+        used = {}
+        registered = 0
+        for p in self.config.get("presets", []):
+            hk = (p.get("hotkey") or "").strip().lower()
+            if not hk:
+                continue
+            if hk in used:
+                self.hotkey_errors.append(
+                    f"« {hk} » est en double ({used[hk]} et {p['name']})")
+                continue
+            try:
+                keyboard.add_hotkey(
+                    hk, lambda name=p["name"]: self._on_preset_hotkey(name))
+                used[hk] = p["name"]
+                registered += 1
+            except Exception as e:
+                self.hotkey_errors.append(f"{p['name']} ({hk}) : {e}")
+        self.registered_count = registered
+        self.hotkey_ok = (len(self.hotkey_errors) == 0)
+        return self.hotkey_ok
 
-    def _on_hotkey(self):
+    def _on_preset_hotkey(self, preset_name):
         # Capture immédiate (l'app cible est encore au premier plan),
-        # puis on bascule sur le thread Tk pour ouvrir la fenêtre.
+        # puis on ouvre l'aperçu sur le thread Tk, présélectionné sur ce preset.
         self.target_hwnd = win32gui.GetForegroundWindow()
         selection = capture_selection()
-        self.root.after(0, lambda: self._open_preview(selection))
+        self.root.after(0, lambda: self._open_preview(selection, preset_name))
 
     # ---- Fenêtre d'aperçu ---------------------------------------------------
-    def _open_preview(self, selection):
+    def _open_preview(self, selection, preset_name=None):
         if self.preview_win and self.preview_win.win.winfo_exists():
             self.preview_win.win.lift()
-            self.preview_win.set_source(selection)
+            self.preview_win.set_source(selection, preset_name)
             return
-        self.preview_win = PreviewWindow(self, selection)
+        self.preview_win = PreviewWindow(self, selection, preset_name)
 
     # ---- Fenêtre paramètres -------------------------------------------------
     def open_settings(self):
@@ -658,7 +683,7 @@ class TextEnhancerApp:
     def manual_trigger(self):
         """Déclenchement depuis le menu tray : utilise le presse-papiers actuel."""
         self.target_hwnd = None
-        self.root.after(0, lambda: self._open_preview(get_clipboard_text()))
+        self.root.after(0, lambda: self._open_preview(get_clipboard_text(), None))
 
     # ---- Tray ---------------------------------------------------------------
     def _make_tray_image(self):
@@ -696,14 +721,15 @@ class TextEnhancerApp:
             pass
         self.root.after(0, self.root.destroy)
 
-    def reload_hotkey(self):
-        ok = self._register_hotkey()
+    def reload_hotkeys(self):
+        ok = self._register_hotkeys()
         if not ok:
             messagebox.showwarning(
                 APP_NAME,
-                f"Le raccourci « {self.config['hotkey']} » n'a pas pu être "
-                f"enregistré ({self.hotkey_error}).\n\nVérifie qu'il est valide "
-                "(ex. alt+q, ctrl+alt+r, ctrl+shift+e).")
+                "Certains raccourcis n'ont pas pu être enregistrés :\n\n- "
+                + "\n- ".join(self.hotkey_errors)
+                + "\n\nVérifie qu'ils sont valides (ex. alt+q, ctrl+alt+r) "
+                "et non dupliqués.")
         return ok
 
     # ---- Mise à jour --------------------------------------------------------
@@ -772,8 +798,9 @@ class TextEnhancerApp:
         if not self.hotkey_ok:
             self.root.after(900, lambda: messagebox.showwarning(
                 APP_NAME,
-                f"Le raccourci « {self.config['hotkey']} » n'a pas pu être "
-                "enregistré. Modifie-le dans les Paramètres.\n\nTu peux aussi "
+                "Certains raccourcis de presets n'ont pas pu être enregistrés :"
+                "\n\n- " + "\n- ".join(self.hotkey_errors)
+                + "\n\nModifie-les dans Paramètres → Presets. Tu peux aussi "
                 "utiliser « Améliorer (presse-papiers) » via l'icône de la "
                 "barre des tâches."))
         # Vérification des mises à jour au démarrage (en arrière-plan).
@@ -782,28 +809,70 @@ class TextEnhancerApp:
         self.root.mainloop()
 
 
+def compute_window_geometry(width, height, prefer_second_left=True):
+    """Renvoie une chaîne Tk 'WxH+X+Y'. Si prefer_second_left et qu'un 2e écran
+    existe, place la fenêtre sur la MOITIÉ GAUCHE de ce 2e écran ; sinon centre
+    la fenêtre (taille demandée) sur l'écran principal."""
+    mons = []
+    try:
+        for (hmon, _hdc, _rect) in win32api.EnumDisplayMonitors():
+            mons.append(win32api.GetMonitorInfo(hmon))
+    except Exception:
+        mons = []
+    if not mons:
+        return f"{width}x{height}"
+
+    primary = None
+    for mi in mons:
+        if mi.get("Flags", 0) & 1:  # MONITORINFOF_PRIMARY
+            primary = mi
+    second = None
+    for mi in mons:
+        if mi is not primary:
+            second = mi
+            break
+
+    if prefer_second_left and second is not None:
+        l, t, r, b = second.get("Work") or second.get("Monitor")
+        w = max(1, (r - l) // 2)
+        h = max(1, b - t)
+        return f"{w}x{h}+{l}+{t}"
+
+    target = primary or mons[0]
+    l, t, r, b = target.get("Work") or target.get("Monitor")
+    x = l + max(0, ((r - l) - width) // 2)
+    y = t + max(0, ((b - t) - height) // 2)
+    return f"{width}x{height}+{x}+{y}"
+
+
 # =============================================================================
 #  Fenêtre d'aperçu
 # =============================================================================
 class PreviewWindow:
-    def __init__(self, app, source_text):
+    def __init__(self, app, source_text, preset_name=None):
         self.app = app
         self.cfg = app.config
         self.source_text = source_text or ""
 
         self.win = tk.Toplevel(app.root)
         self.win.title(f"{APP_NAME} — Aperçu")
-        self.win.geometry("780x640")
         self.win.minsize(560, 480)
         self.win.attributes("-topmost", True)
+        try:
+            self.win.geometry(compute_window_geometry(
+                780, 640, self.cfg.get("window_second_left", True)))
+        except Exception:
+            self.win.geometry("780x640")
 
         preset_names = [p["name"] for p in self.cfg["presets"]]
+        initial = preset_name if (preset_name in preset_names) else (
+            preset_names[0] if preset_names else "")
 
         # --- Barre du haut : preset + modèle (toujours visible) ---
         top = ttk.Frame(self.win, padding=(10, 8))
         top.pack(side="top", fill="x")
         ttk.Label(top, text="Style :").grid(row=0, column=0, sticky="w")
-        self.preset_var = tk.StringVar(value=preset_names[0] if preset_names else "")
+        self.preset_var = tk.StringVar(value=initial)
         self.preset_cb = ttk.Combobox(top, textvariable=self.preset_var,
                                       values=preset_names, state="readonly",
                                       width=28)
@@ -879,9 +948,16 @@ class PreviewWindow:
             self.win.after(150, self.generate)
         else:
             self.status_var.set("Aucun texte capturé. Sélectionne du texte "
-                                "(Ctrl+C) puis Alt+Q.")
+                                "(Ctrl+C) puis le raccourci du preset.")
 
-    def set_source(self, text):
+    def _select_preset(self, name):
+        names = [p["name"] for p in self.cfg["presets"]]
+        if name and name in names:
+            self.preset_var.set(name)
+
+    def set_source(self, text, preset_name=None):
+        if preset_name:
+            self._select_preset(preset_name)
         self.source_text = text or ""
         self.src_text.configure(state="normal")
         self.src_text.delete("1.0", "end")
@@ -1003,17 +1079,21 @@ class SettingsWindow:
         ttk.Button(f, text="Charger la liste des modèles",
                    command=self._refresh_models).grid(row=1, column=2, padx=6)
 
-        ttk.Label(f, text="Raccourci clavier :").grid(row=2, column=0, sticky="w", pady=4)
-        self.hotkey_var = tk.StringVar(value=self.cfg.get("hotkey", "alt+q"))
-        ttk.Entry(f, textvariable=self.hotkey_var, width=20).grid(
-            row=2, column=1, sticky="w", pady=4)
-        ttk.Label(f, text="(ex : alt+q, ctrl+alt+r, ctrl+shift+e)",
-                  foreground="#666").grid(row=3, column=1, sticky="w")
+        ttk.Label(f, text="Les raccourcis clavier se règlent par preset "
+                  "(onglet « Presets »).", foreground="#666").grid(
+            row=2, column=1, sticky="w", pady=(6, 2))
+
+        self.second_left_var = tk.BooleanVar(
+            value=self.cfg.get("window_second_left", True))
+        ttk.Checkbutton(
+            f, text="Afficher la fenêtre sur le 2e écran (moitié gauche)",
+            variable=self.second_left_var).grid(
+            row=3, column=1, sticky="w", pady=(4, 2))
 
         self.startup_var = tk.BooleanVar(value=is_startup_enabled())
         ttk.Checkbutton(f, text="Lancer au démarrage de Windows",
                         variable=self.startup_var).grid(
-            row=4, column=1, sticky="w", pady=(10, 2))
+            row=4, column=1, sticky="w", pady=(4, 2))
 
         ttk.Label(f, text="Dépôt GitHub :").grid(row=5, column=0, sticky="w", pady=4)
         self.repo_var = tk.StringVar(value=self.cfg.get("github_repo", ""))
@@ -1071,6 +1151,10 @@ class SettingsWindow:
         self.name_var = tk.StringVar()
         ttk.Entry(right, textvariable=self.name_var, width=50).pack(
             anchor="w", fill="x")
+        ttk.Label(right, text="Raccourci clavier (ex : alt+q, ctrl+alt+r) — "
+                  "laisser vide pour aucun :").pack(anchor="w", pady=(8, 0))
+        self.hotkey_var = tk.StringVar()
+        ttk.Entry(right, textvariable=self.hotkey_var, width=24).pack(anchor="w")
         ttk.Label(right, text="Instruction (prompt système) :").pack(
             anchor="w", pady=(8, 0))
         self.instr_text = tk.Text(right, wrap="word", height=16)
@@ -1099,6 +1183,7 @@ class SettingsWindow:
         if i is None:
             return
         self.name_var.set(self.presets[i]["name"])
+        self.hotkey_var.set(self.presets[i].get("hotkey", ""))
         self.instr_text.delete("1.0", "end")
         self.instr_text.insert("1.0", self.presets[i]["instruction"])
 
@@ -1107,12 +1192,13 @@ class SettingsWindow:
         if i is None:
             return
         self.presets[i]["name"] = self.name_var.get().strip() or "Sans nom"
+        self.presets[i]["hotkey"] = self.hotkey_var.get().strip().lower()
         self.presets[i]["instruction"] = self.instr_text.get("1.0", "end-1c")
         self._reload_preset_list()
         self.preset_list.selection_set(i)
 
     def _add_preset(self):
-        self.presets.append({"name": "Nouveau preset",
+        self.presets.append({"name": "Nouveau preset", "hotkey": "",
                              "instruction": "Décris ici l'instruction…"})
         self._reload_preset_list()
         i = len(self.presets) - 1
@@ -1135,10 +1221,9 @@ class SettingsWindow:
         self._apply_preset_edit()
         self.cfg["api_key"] = self.api_var.get().strip()
         self.cfg["default_model"] = self.model_var.get().strip()
-        old_hotkey = self.cfg.get("hotkey")
-        self.cfg["hotkey"] = self.hotkey_var.get().strip() or "alt+q"
         self.cfg["github_repo"] = self.repo_var.get().strip()
         self.cfg["check_updates_on_start"] = bool(self.updcheck_var.get())
+        self.cfg["window_second_left"] = bool(self.second_left_var.get())
         self.cfg["presets"] = self.presets
         save_config(self.cfg)
 
@@ -1149,11 +1234,10 @@ class SettingsWindow:
                                    f"Démarrage Windows non configuré : {e}",
                                    parent=self.win)
 
-        if old_hotkey != self.cfg["hotkey"]:
-            self.app.reload_hotkey()
-
-        messagebox.showinfo(APP_NAME, "Paramètres enregistrés.", parent=self.win)
+        # Les raccourcis peuvent avoir changé : on ré-enregistre toujours.
         self.win.destroy()
+        self.app.reload_hotkeys()
+        messagebox.showinfo(APP_NAME, "Paramètres enregistrés.")
 
 
 # =============================================================================
