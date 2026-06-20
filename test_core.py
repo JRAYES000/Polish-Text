@@ -74,6 +74,18 @@ check("palette claire et sombre définies",
 check("get_palette défaut = clair",
       main.get_palette({}) is main.PALETTES["light"])
 
+print("== Liens (parsing) ==")
+segs = main.parse_segments(
+    "Voir [Notion](https://app.notion.com/p/x?source=copy_link) ici")
+check("lien Markdown -> texte + url",
+      any(u == "https://app.notion.com/p/x?source=copy_link" and t == "Notion"
+          for (t, b, u) in segs))
+check("aucun marqueur []() dans les segments",
+      not any("](" in t for (t, b, u) in segs))
+segs2 = main.parse_segments("Lien nu https://example.com/a fin.")
+check("URL nue détectée comme lien",
+      any(u == "https://example.com/a" for (t, b, u) in segs2))
+
 print()
 if failures:
     print(f"ÉCHEC : {len(failures)} test(s) en échec -> {failures}")

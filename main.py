@@ -20,6 +20,7 @@ Auteur : généré pour Julien. Licence : usage personnel.
 """
 
 import os
+import re
 import sys
 import json
 import time
@@ -59,7 +60,7 @@ OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 # --- Version & mise à jour automatique ---------------------------------------
 # Dépôt GitHub utilisé pour les mises à jour (modifiable aussi dans
 # Paramètres → Dépôt GitHub, sans recompiler).
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 GITHUB_REPO = "JRAYES000/Polish-Text"
 GITHUB_API_LATEST = "https://api.github.com/repos/{repo}/releases/latest"
 
@@ -311,11 +312,15 @@ def set_clipboard_html(html_fragment, plain_text):
     return False
 
 
-# --- Rendu « vrai gras » dans un widget Text (pas de marqueurs visibles) -----
+# --- Rendu enrichi (gras + liens cliquables) dans un widget Text -------------
+LINK_MD_RE = re.compile(r"\[([^\]]*)\]\((https?://[^)\s]+)\)")
+URL_RE = re.compile(r"(https?://[^\s)]+)")
+LINK_COLOR = "#2563eb"
+
+
 def _normalize_bold(line):
     """Convertit le gras HTML (<b>, <strong>) et __..__ en **..** pour un
     découpage uniforme."""
-    import re
     s = re.sub(r"</?(?:b|strong)\s*>", "**", line, flags=re.IGNORECASE)
     s = re.sub(r"__(.+?)__", r"**\1**", s)
     return s
@@ -332,13 +337,58 @@ def _parse_bold_runs(line):
     return runs
 
 
+def _segments_plain(s):
+    """Segments (texte, gras, url|None) en détectant les URLs nues."""
+    out = []
+    pos = 0
+    for m in URL_RE.finditer(s):
+        for t, b in _parse_bold_runs(s[pos:m.start()]):
+            out.append((t, b, None))
+        out.append((m.group(1), False, m.group(1)))  # URL nue, cliquable
+        pos = m.end()
+    for t, b in _parse_bold_runs(s[pos:]):
+        out.append((t, b, None))
+    return out
+
+
+def parse_segments(line):
+    """Découpe une ligne en segments (texte, gras?, url|None) : gère les liens
+    Markdown [texte](url) ET les URLs nues."""
+    out = []
+    pos = 0
+    for m in LINK_MD_RE.finditer(line):
+        out.extend(_segments_plain(line[pos:m.start()]))
+        text, url = (m.group(1) or m.group(2)), m.group(2)
+        out.append((text, False, url))  # lien Markdown : texte cliquable
+        pos = m.end()
+    out.extend(_segments_plain(line[pos:]))
+    return out
+
+
+def _insert_segment(widget, text, bold, url):
+    tags = []
+    if bold:
+        tags.append("bold")
+    if url:
+        tag = f"link-{widget._link_counter}"
+        widget._link_counter += 1
+        widget._link_urls[tag] = url
+        widget.tag_configure(tag, foreground=LINK_COLOR, underline=1)
+        widget.tag_bind(tag, "<Button-1>", lambda e, u=url: webbrowser.open(u))
+        widget.tag_bind(tag, "<Enter>",
+                        lambda e: widget.configure(cursor="hand2"))
+        widget.tag_bind(tag, "<Leave>", lambda e: widget.configure(cursor=""))
+        tags.append(tag)
+    widget.insert("end", text, tuple(tags))
+
+
 def render_markup_into(text_widget, markup):
-    """Affiche le texte du LLM dans le widget AVEC un vrai gras, sans laisser
-    apparaître les marqueurs ** ni les balises <b>. Gère titres (#), puces
-    (-, *, +) et gras en ligne."""
-    import re
+    """Affiche le texte du LLM avec un vrai gras et des liens cliquables, sans
+    laisser apparaître les marqueurs ** ni la syntaxe [texte](url)."""
     text_widget.configure(state="normal")
     text_widget.delete("1.0", "end")
+    text_widget._link_urls = {}
+    text_widget._link_counter = 0
     lines = (markup or "").replace("\r\n", "\n").split("\n")
     for li, line in enumerate(lines):
         heading = False
@@ -349,29 +399,71 @@ def render_markup_into(text_widget, markup):
         if mb:
             text_widget.insert("end", "•  ")
             line = mb.group(1)
-        if heading:
-            text_widget.insert("end", line, ("bold",))
-        else:
-            for seg, is_bold in _parse_bold_runs(line):
-                text_widget.insert("end", seg, ("bold",) if is_bold else ())
+        for seg, is_bold, url in parse_segments(line):
+            # Un lien n'est jamais en gras (évite tout chevauchement de balises).
+            _insert_segment(text_widget, seg, (is_bold or heading) and not url, url)
         if li < len(lines) - 1:
             text_widget.insert("end", "\n")
 
 
+def _esc_html(s):
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def text_widget_to_html(text_widget):
-    """Reconstruit un fragment HTML (gras réel + sauts de ligne) à partir du
-    contenu et des plages 'bold' du widget — fonctionne même après édition."""
+    """Reconstruit un fragment HTML (gras + liens <a> + sauts de ligne) à partir
+    du contenu et des plages du widget — fonctionne même après édition."""
+    urls = getattr(text_widget, "_link_urls", {})
     parts = []
     for key, value, _ in text_widget.dump("1.0", "end-1c", text=True, tag=True):
         if key == "text":
-            esc = (value.replace("&", "&amp;").replace("<", "&lt;")
-                   .replace(">", "&gt;").replace("\n", "<br>\n"))
-            parts.append(esc)
-        elif key == "tagon" and value == "bold":
-            parts.append("<b>")
-        elif key == "tagoff" and value == "bold":
-            parts.append("</b>")
+            parts.append(_esc_html(value).replace("\n", "<br>\n"))
+        elif key == "tagon":
+            if value == "bold":
+                parts.append("<b>")
+            elif value.startswith("link-"):
+                href = _esc_html(urls.get(value, "")).replace('"', "%22")
+                parts.append(f'<a href="{href}">')
+        elif key == "tagoff":
+            if value == "bold":
+                parts.append("</b>")
+            elif value.startswith("link-"):
+                parts.append("</a>")
     return "".join(parts)
+
+
+def text_widget_to_plain(text_widget):
+    """Texte brut : conserve les URLs sous la forme « texte (url) » (ou juste
+    l'url quand le texte du lien EST l'url)."""
+    urls = getattr(text_widget, "_link_urls", {})
+    out = []
+    active_url = None
+    link_text = []
+    for key, value, _ in text_widget.dump("1.0", "end-1c", text=True, tag=True):
+        if key == "text":
+            (link_text if active_url is not None else out).append(value)
+        elif key == "tagon" and value.startswith("link-"):
+            active_url = urls.get(value, "")
+            link_text = []
+        elif key == "tagoff" and value.startswith("link-"):
+            t = "".join(link_text).strip()
+            out.append(f"{t} ({active_url})" if (t and t != active_url)
+                       else (active_url or t))
+            active_url = None
+            link_text = []
+    return "".join(out)
+
+
+def style_editor(widget):
+    """Fond blanc + texte foncé pour les zones d'édition principales
+    (lisibilité garantie, même en thème sombre)."""
+    try:
+        widget.configure(background="#ffffff", foreground="#1f2430",
+                         insertbackground="#1f2430", selectbackground="#cfe0ff",
+                         highlightthickness=1, highlightbackground="#c9ccd1",
+                         highlightcolor="#2563eb", relief="flat", borderwidth=0)
+    except Exception:
+        pass
 
 
 # =============================================================================
@@ -1096,7 +1188,7 @@ class PreviewWindow:
         self.src_text.pack(side="left", fill="both", expand=True)
         self.src_text.insert("1.0", self.source_text)
         self.src_text.configure(state="disabled")
-        style_text_widget(self.src_text, self.pal)
+        style_editor(self.src_text)
 
         rwrap = ttk.Frame(res_frame)
         rwrap.pack(fill="both", expand=True)
@@ -1106,7 +1198,7 @@ class PreviewWindow:
         self.result_text.configure(yscrollcommand=rscroll.set)
         rscroll.pack(side="right", fill="y")
         self.result_text.pack(side="left", fill="both", expand=True)
-        style_text_widget(self.result_text, self.pal)
+        style_editor(self.result_text)
 
         # Tag « gras » pour l'affichage en mise en forme réelle.
         try:
@@ -1336,7 +1428,7 @@ class PreviewWindow:
         self.gen_btn.configure(state="normal")
 
     def _result_plain(self):
-        return self.result_text.get("1.0", "end-1c")
+        return text_widget_to_plain(self.result_text)
 
     def _result_html(self):
         return text_widget_to_html(self.result_text)
