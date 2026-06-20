@@ -37,12 +37,15 @@ import pystray
 from PIL import Image, ImageDraw
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, font as tkfont
 
 # --- Spécifique Windows ------------------------------------------------------
 import win32clipboard
 import win32con
 import win32gui
+import win32event
+import win32api
+import winerror
 import winreg
 
 
@@ -54,7 +57,7 @@ OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 # --- Version & mise à jour automatique ---------------------------------------
 # Dépôt GitHub utilisé pour les mises à jour (modifiable aussi dans
 # Paramètres → Dépôt GitHub, sans recompiler).
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 GITHUB_REPO = "JRAYES000/Polish-Text"
 GITHUB_API_LATEST = "https://api.github.com/repos/{repo}/releases/latest"
 
@@ -209,21 +212,16 @@ def _build_cf_html(fragment_html):
     return header + html_pre + fragment_html + html_post
 
 
-def set_clipboard_rich(markdown_text):
-    """Met dans le presse-papiers une version HTML (texte enrichi : gras,
-    listes...) ET une version texte brut de secours."""
-    html_fragment = md_lib.markdown(
-        markdown_text, extensions=["extra", "sane_lists", "nl2br"]
-    )
+def set_clipboard_html(html_fragment, plain_text):
+    """Place dans le presse-papiers une version HTML (texte enrichi : gras,
+    sauts de ligne...) ET une version texte brut de secours."""
     cf_html_payload = _build_cf_html(html_fragment).encode("utf-8")
-    plain = markdown_to_plain(markdown_text)
-
     for _ in range(10):
         try:
             win32clipboard.OpenClipboard()
             try:
                 win32clipboard.EmptyClipboard()
-                win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, plain)
+                win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, plain_text)
                 cf_html = win32clipboard.RegisterClipboardFormat("HTML Format")
                 win32clipboard.SetClipboardData(cf_html, cf_html_payload)
                 return True
@@ -234,18 +232,67 @@ def set_clipboard_rich(markdown_text):
     return False
 
 
-def markdown_to_plain(text):
-    """Version texte brut « propre » : enlève les marqueurs Markdown les plus
-    courants pour les applications qui n'acceptent pas le texte enrichi."""
+# --- Rendu « vrai gras » dans un widget Text (pas de marqueurs visibles) -----
+def _normalize_bold(line):
+    """Convertit le gras HTML (<b>, <strong>) et __..__ en **..** pour un
+    découpage uniforme."""
     import re
-    t = text
-    t = re.sub(r"\*\*(.+?)\*\*", r"\1", t)   # **gras**
-    t = re.sub(r"__(.+?)__", r"\1", t)       # __gras__
-    t = re.sub(r"\*(.+?)\*", r"\1", t)       # *italique*
-    t = re.sub(r"`{1,3}(.+?)`{1,3}", r"\1", t)  # `code`
-    t = re.sub(r"^#{1,6}\s*", "", t, flags=re.MULTILINE)  # titres
-    t = re.sub(r"^\s*[-*+]\s+", "• ", t, flags=re.MULTILINE)  # puces
-    return t
+    s = re.sub(r"</?(?:b|strong)\s*>", "**", line, flags=re.IGNORECASE)
+    s = re.sub(r"__(.+?)__", r"**\1**", s)
+    return s
+
+
+def _parse_bold_runs(line):
+    """Découpe une ligne en segments (texte, gras?) selon les marqueurs **."""
+    runs = []
+    bold = False
+    for part in _normalize_bold(line).split("**"):
+        if part:
+            runs.append((part, bold))
+        bold = not bold
+    return runs
+
+
+def render_markup_into(text_widget, markup):
+    """Affiche le texte du LLM dans le widget AVEC un vrai gras, sans laisser
+    apparaître les marqueurs ** ni les balises <b>. Gère titres (#), puces
+    (-, *, +) et gras en ligne."""
+    import re
+    text_widget.configure(state="normal")
+    text_widget.delete("1.0", "end")
+    lines = (markup or "").replace("\r\n", "\n").split("\n")
+    for li, line in enumerate(lines):
+        heading = False
+        m = re.match(r"^\s*#{1,6}\s*(.*)$", line)
+        if m:
+            line, heading = m.group(1), True
+        mb = re.match(r"^\s*[-*+]\s+(.*)$", line)
+        if mb:
+            text_widget.insert("end", "•  ")
+            line = mb.group(1)
+        if heading:
+            text_widget.insert("end", line, ("bold",))
+        else:
+            for seg, is_bold in _parse_bold_runs(line):
+                text_widget.insert("end", seg, ("bold",) if is_bold else ())
+        if li < len(lines) - 1:
+            text_widget.insert("end", "\n")
+
+
+def text_widget_to_html(text_widget):
+    """Reconstruit un fragment HTML (gras réel + sauts de ligne) à partir du
+    contenu et des plages 'bold' du widget — fonctionne même après édition."""
+    parts = []
+    for key, value, _ in text_widget.dump("1.0", "end-1c", text=True, tag=True):
+        if key == "text":
+            esc = (value.replace("&", "&amp;").replace("<", "&lt;")
+                   .replace(">", "&gt;").replace("\n", "<br>\n"))
+            parts.append(esc)
+        elif key == "tagon" and value == "bold":
+            parts.append("<b>")
+        elif key == "tagoff" and value == "bold":
+            parts.append("</b>")
+    return "".join(parts)
 
 
 # =============================================================================
@@ -282,12 +329,13 @@ def capture_selection():
     return get_clipboard_text() or before
 
 
-def paste_into(target_hwnd, rich=True, text=""):
-    """Redonne le focus à l'application cible puis colle (Ctrl+V)."""
-    if rich:
-        set_clipboard_rich(text)
+def paste_into(target_hwnd, html=None, plain=""):
+    """Redonne le focus à l'application cible puis colle (Ctrl+V). Si `html`
+    est fourni, colle en texte enrichi ; sinon en texte brut."""
+    if html is not None:
+        set_clipboard_html(html, plain)
     else:
-        set_clipboard_text(text)
+        set_clipboard_text(plain)
     time.sleep(0.05)
     if target_hwnd:
         try:
@@ -614,51 +662,31 @@ class PreviewWindow:
 
         self.win = tk.Toplevel(app.root)
         self.win.title(f"{APP_NAME} — Aperçu")
-        self.win.geometry("720x560")
+        self.win.geometry("780x640")
+        self.win.minsize(560, 480)
         self.win.attributes("-topmost", True)
 
         preset_names = [p["name"] for p in self.cfg["presets"]]
 
-        # --- Barre du haut : preset + modèle ---
-        top = ttk.Frame(self.win, padding=10)
-        top.pack(fill="x")
-
+        # --- Barre du haut : preset + modèle (toujours visible) ---
+        top = ttk.Frame(self.win, padding=(10, 8))
+        top.pack(side="top", fill="x")
         ttk.Label(top, text="Style :").grid(row=0, column=0, sticky="w")
         self.preset_var = tk.StringVar(value=preset_names[0] if preset_names else "")
         self.preset_cb = ttk.Combobox(top, textvariable=self.preset_var,
                                       values=preset_names, state="readonly",
-                                      width=30)
+                                      width=28)
         self.preset_cb.grid(row=0, column=1, sticky="w", padx=(4, 16))
-
         ttk.Label(top, text="Modèle :").grid(row=0, column=2, sticky="w")
         self.model_var = tk.StringVar(value=self.cfg.get("default_model", ""))
         self.model_cb = ttk.Combobox(top, textvariable=self.model_var,
                                      values=self.cfg.get("known_models", []),
-                                     width=28)
+                                     width=26)
         self.model_cb.grid(row=0, column=3, sticky="w", padx=(4, 0))
 
-        # --- Texte source (repliable, lecture) ---
-        src_frame = ttk.LabelFrame(self.win, text="Texte sélectionné", padding=6)
-        src_frame.pack(fill="x", padx=10, pady=(0, 6))
-        self.src_text = tk.Text(src_frame, height=4, wrap="word")
-        self.src_text.pack(fill="x")
-        self.src_text.insert("1.0", self.source_text)
-        self.src_text.configure(state="disabled")
-
-        # --- Résultat (éditable) ---
-        res_frame = ttk.LabelFrame(self.win, text="Résultat (éditable)", padding=6)
-        res_frame.pack(fill="both", expand=True, padx=10, pady=(0, 6))
-        self.result_text = tk.Text(res_frame, wrap="word")
-        self.result_text.pack(fill="both", expand=True)
-
-        # --- Statut ---
-        self.status_var = tk.StringVar(value="")
-        ttk.Label(self.win, textvariable=self.status_var,
-                  foreground="#2563eb").pack(fill="x", padx=12)
-
-        # --- Boutons ---
-        btns = ttk.Frame(self.win, padding=10)
-        btns.pack(fill="x")
+        # --- Barre de boutons : packée AVANT le centre -> TOUJOURS visible ---
+        btns = ttk.Frame(self.win, padding=(10, 8))
+        btns.pack(side="bottom", fill="x")
         self.gen_btn = ttk.Button(btns, text="Générer / Regénérer",
                                   command=self.generate)
         self.gen_btn.pack(side="left")
@@ -671,14 +699,56 @@ class PreviewWindow:
         ttk.Button(btns, text="Fermer",
                    command=self.win.destroy).pack(side="right")
 
+        self.status_var = tk.StringVar(value="")
+        ttk.Label(self.win, textvariable=self.status_var, foreground="#2563eb",
+                  padding=(12, 0)).pack(side="bottom", fill="x")
+
+        # --- Zone centrale redimensionnable : on tire le séparateur (sash) ---
+        paned = ttk.PanedWindow(self.win, orient="vertical")
+        paned.pack(side="top", fill="both", expand=True, padx=10, pady=(0, 4))
+
+        src_frame = ttk.LabelFrame(paned, text="Texte sélectionné", padding=6)
+        res_frame = ttk.LabelFrame(
+            paned, text="Résultat (éditable — mise en forme réelle)", padding=6)
+        paned.add(src_frame, weight=1)
+        paned.add(res_frame, weight=3)
+
+        swrap = ttk.Frame(src_frame)
+        swrap.pack(fill="both", expand=True)
+        self.src_text = tk.Text(swrap, height=4, wrap="word")
+        sscroll = ttk.Scrollbar(swrap, orient="vertical",
+                                command=self.src_text.yview)
+        self.src_text.configure(yscrollcommand=sscroll.set)
+        sscroll.pack(side="right", fill="y")
+        self.src_text.pack(side="left", fill="both", expand=True)
+        self.src_text.insert("1.0", self.source_text)
+        self.src_text.configure(state="disabled")
+
+        rwrap = ttk.Frame(res_frame)
+        rwrap.pack(fill="both", expand=True)
+        self.result_text = tk.Text(rwrap, wrap="word", undo=True)
+        rscroll = ttk.Scrollbar(rwrap, orient="vertical",
+                                command=self.result_text.yview)
+        self.result_text.configure(yscrollcommand=rscroll.set)
+        rscroll.pack(side="right", fill="y")
+        self.result_text.pack(side="left", fill="both", expand=True)
+
+        # Tag « gras » pour l'affichage en mise en forme réelle.
+        try:
+            base = tkfont.nametofont(self.result_text.cget("font"))
+        except Exception:
+            base = tkfont.nametofont("TkTextFont")
+        bold_font = base.copy()
+        bold_font.configure(weight="bold")
+        self.result_text.tag_configure("bold", font=bold_font)
+
         self.win.bind("<Escape>", lambda e: self.win.destroy())
 
-        # Génération automatique au démarrage si on a du texte.
         if self.source_text.strip():
             self.win.after(150, self.generate)
         else:
-            self.status_var.set("Aucun texte capturé. Sélectionne du texte puis "
-                                "réessaie, ou colle dans le champ ci-dessus.")
+            self.status_var.set("Aucun texte capturé. Sélectionne du texte "
+                                "(Ctrl+C) puis Alt+Q.")
 
     def set_source(self, text):
         self.source_text = text or ""
@@ -718,34 +788,40 @@ class PreviewWindow:
         threading.Thread(target=worker, daemon=True).start()
 
     def _show_result(self, result):
-        self.result_text.delete("1.0", "end")
-        self.result_text.insert("1.0", result)
-        self.status_var.set("Prêt. Édite si besoin puis colle ou copie.")
+        render_markup_into(self.result_text, result)
+        self.status_var.set("Prêt. Le gras est réel : « Coller (texte enrichi) » "
+                            "pour Word/Outlook.")
         self.gen_btn.configure(state="normal")
 
     def _show_error(self, msg):
+        self.result_text.configure(state="normal")
+        self.result_text.delete("1.0", "end")
         self.status_var.set("Erreur : " + msg)
         self.gen_btn.configure(state="normal")
 
-    def _get_result(self):
+    def _result_plain(self):
         return self.result_text.get("1.0", "end-1c")
 
+    def _result_html(self):
+        return text_widget_to_html(self.result_text)
+
     def copy(self):
-        text = self._get_result()
-        if not text.strip():
+        if not self._result_plain().strip():
             return
-        set_clipboard_rich(text)
-        self.status_var.set("Copié dans le presse-papiers (texte enrichi).")
+        set_clipboard_html(self._result_html(), self._result_plain())
+        self.status_var.set("Copié (texte enrichi). Colle avec Ctrl+V dans "
+                            "Word/Outlook.")
 
     def paste(self, rich=True):
-        text = self._get_result()
-        if not text.strip():
+        if not self._result_plain().strip():
             return
         hwnd = self.app.target_hwnd
+        plain = self._result_plain()
+        html = self._result_html() if rich else None
         self.win.destroy()
         # Petit délai pour laisser la fenêtre se fermer avant de coller.
         time.sleep(0.2)
-        paste_into(hwnd, rich=rich, text=text)
+        paste_into(hwnd, html=html, plain=plain)
 
 
 # =============================================================================
@@ -988,7 +1064,33 @@ def set_startup(enable):
 # =============================================================================
 #  Point d'entrée
 # =============================================================================
+def ensure_single_instance():
+    """Empêche deux instances simultanées (sinon conflit sur le raccourci
+    global). Renvoie le handle du mutex à conserver vivant, ou None si une
+    autre instance tourne déjà."""
+    try:
+        mutex = win32event.CreateMutex(None, False, "TextEnhancerAI_singleton")
+        if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
+            return None
+        return mutex
+    except Exception:
+        # En cas de souci avec le mutex, on n'empêche pas le lancement.
+        return True
+
+
 def main():
+    mutex = ensure_single_instance()
+    if mutex is None:
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showinfo(APP_NAME,
+                                "TextEnhancer AI est déjà en cours d'exécution "
+                                "(icône dans la barre des tâches).")
+            root.destroy()
+        except Exception:
+            pass
+        return
     try:
         app = TextEnhancerApp()
         app.start()
