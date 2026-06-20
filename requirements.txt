@@ -1,0 +1,6 @@
+requests
+keyboard
+markdown
+pystray
+pillow
+pywin32
