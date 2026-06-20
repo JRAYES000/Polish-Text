@@ -54,7 +54,7 @@ OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 # --- Version & mise à jour automatique ---------------------------------------
 # Dépôt GitHub utilisé pour les mises à jour (modifiable aussi dans
 # Paramètres → Dépôt GitHub, sans recompiler).
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 GITHUB_REPO = "JRAYES000/Polish-Text"
 GITHUB_API_LATEST = "https://api.github.com/repos/{repo}/releases/latest"
 
@@ -252,18 +252,34 @@ def markdown_to_plain(text):
 #  Capture de la sélection / collage dans l'application cible
 # =============================================================================
 def capture_selection():
-    """Simule Ctrl+C dans l'application active pour récupérer la sélection."""
-    # On relâche les touches du raccourci pour ne pas polluer le Ctrl+C.
-    for k in ("alt", "ctrl", "shift", "windows", "q"):
+    """Récupère le texte sélectionné. On tente une copie automatique (Ctrl+C) ;
+    si elle ne renvoie rien, on se rabat sur le contenu actuel du presse-papiers
+    (cas où l'utilisateur a déjà fait Ctrl+C lui-même). On ne vide JAMAIS le
+    presse-papiers, pour ne pas perdre une copie manuelle."""
+    # Relâche les touches du raccourci pour ne pas parasiter le Ctrl+C.
+    for k in ("alt", "ctrl", "shift", "windows", "q", "r", "e", "w"):
         try:
             keyboard.release(k)
         except Exception:
             pass
-    time.sleep(0.05)
-    set_clipboard_text("")  # vide pour détecter une vraie copie
-    keyboard.send("ctrl+c")
-    time.sleep(0.2)
-    return get_clipboard_text()
+    time.sleep(0.12)
+
+    before = get_clipboard_text()
+    try:
+        keyboard.send("ctrl+c")
+    except Exception:
+        pass
+
+    # Attend qu'une nouvelle sélection soit copiée (jusqu'à ~1,2 s).
+    deadline = time.time() + 1.2
+    while time.time() < deadline:
+        time.sleep(0.08)
+        current = get_clipboard_text()
+        if current and current != before:
+            return current
+
+    # Rien de neuf : on garde ce qui était déjà dans le presse-papiers.
+    return get_clipboard_text() or before
 
 
 def paste_into(target_hwnd, rich=True, text=""):
