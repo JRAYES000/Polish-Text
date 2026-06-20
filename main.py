@@ -59,7 +59,7 @@ OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 # --- Version & mise à jour automatique ---------------------------------------
 # Dépôt GitHub utilisé pour les mises à jour (modifiable aussi dans
 # Paramètres → Dépôt GitHub, sans recompiler).
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 GITHUB_REPO = "JRAYES000/Polish-Text"
 GITHUB_API_LATEST = "https://api.github.com/repos/{repo}/releases/latest"
 
@@ -835,8 +835,12 @@ def compute_window_geometry(width, height, prefer_second_left=True):
     if prefer_second_left and second is not None:
         l, t, r, b = second.get("Work") or second.get("Monitor")
         w = max(1, (r - l) // 2)
-        h = max(1, b - t)
-        return f"{w}x{h}+{l}+{t}"
+        # On garde une marge en haut et en bas : la barre de titre s'ajoute à la
+        # hauteur, et il faut que le bas (les boutons) ne passe pas sous la
+        # barre des tâches.
+        margin_top = 30
+        h = max(300, (b - t) - 100)
+        return f"{w}x{h}+{l}+{t + margin_top}"
 
     target = primary or mons[0]
     l, t, r, b = target.get("Work") or target.get("Monitor")
@@ -857,12 +861,17 @@ class PreviewWindow:
         self.win = tk.Toplevel(app.root)
         self.win.title(f"{APP_NAME} — Aperçu")
         self.win.minsize(560, 480)
-        self.win.attributes("-topmost", True)
         try:
             self.win.geometry(compute_window_geometry(
                 780, 640, self.cfg.get("window_second_left", True)))
         except Exception:
             self.win.geometry("780x640")
+        # Apparaît au premier plan, puis redevient une fenêtre normale : elle
+        # passe en arrière-plan dès qu'on clique ailleurs.
+        self.win.lift()
+        self.win.focus_force()
+        self.win.attributes("-topmost", True)
+        self.win.after(400, self._release_topmost)
 
         preset_names = [p["name"] for p in self.cfg["presets"]]
         initial = preset_name if (preset_name in preset_names) else (
@@ -949,6 +958,13 @@ class PreviewWindow:
         else:
             self.status_var.set("Aucun texte capturé. Sélectionne du texte "
                                 "(Ctrl+C) puis le raccourci du preset.")
+
+    def _release_topmost(self):
+        try:
+            if self.win.winfo_exists():
+                self.win.attributes("-topmost", False)
+        except Exception:
+            pass
 
     def _select_preset(self, name):
         names = [p["name"] for p in self.cfg["presets"]]
@@ -1042,7 +1058,10 @@ class SettingsWindow:
         self.win = tk.Toplevel(app.root)
         self.win.title(f"{APP_NAME} — Paramètres")
         self.win.geometry("760x620")
+        self.win.lift()
+        self.win.focus_force()
         self.win.attributes("-topmost", True)
+        self.win.after(400, self._release_topmost)
 
         nb = ttk.Notebook(self.win)
         nb.pack(fill="both", expand=True, padx=8, pady=8)
@@ -1056,6 +1075,13 @@ class SettingsWindow:
                    command=self.save).pack(side="right")
         ttk.Button(bottom, text="Fermer",
                    command=self.win.destroy).pack(side="right", padx=6)
+
+    def _release_topmost(self):
+        try:
+            if self.win.winfo_exists():
+                self.win.attributes("-topmost", False)
+        except Exception:
+            pass
 
     # ---- Onglet général -----------------------------------------------------
     def _build_general_tab(self, nb):
