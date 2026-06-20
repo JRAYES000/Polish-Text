@@ -59,7 +59,7 @@ OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 # --- Version & mise à jour automatique ---------------------------------------
 # Dépôt GitHub utilisé pour les mises à jour (modifiable aussi dans
 # Paramètres → Dépôt GitHub, sans recompiler).
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 GITHUB_REPO = "JRAYES000/Polish-Text"
 GITHUB_API_LATEST = "https://api.github.com/repos/{repo}/releases/latest"
 
@@ -538,6 +538,7 @@ def download_and_apply_update(asset_url):
         raise RuntimeError("La mise à jour automatique n'est disponible que "
                            "pour l'exécutable (.exe).")
     current_exe = sys.executable
+    exe_name = os.path.basename(current_exe)
     new_exe = os.path.join(tempfile.gettempdir(), "TextEnhancerAI_new.exe")
 
     with requests.get(asset_url, stream=True, timeout=180) as r:
@@ -571,8 +572,19 @@ def download_and_apply_update(asset_url):
         f'echo [%DATE% %TIME%] echec apres 60 tentatives>> "{log}"\r\n'
         "exit\r\n"
         ":done\r\n"
-        f'echo [%DATE% %TIME%] remplacement OK, redemarrage>> "{log}"\r\n'
+        f'echo [%DATE% %TIME%] move OK, pause avant relance>> "{log}"\r\n'
+        # Pause : laisse l'antivirus finir de scanner l'exe fraîchement déplacé
+        # (sinon l'extraction du DLL Python au lancement peut échouer).
+        "ping 127.0.0.1 -n 4 >nul\r\n"
         f'start "" "{current_exe}"\r\n'
+        # Vérifie que l'app a bien démarré ; sinon, relance de secours.
+        "ping 127.0.0.1 -n 6 >nul\r\n"
+        f'tasklist /FI "IMAGENAME eq {exe_name}" /NH 2>nul | find /I "{exe_name}" >nul\r\n'
+        "if not errorlevel 1 goto launched\r\n"
+        f'echo [%DATE% %TIME%] 1er demarrage KO, relance de secours>> "{log}"\r\n'
+        f'start "" "{current_exe}"\r\n'
+        ":launched\r\n"
+        f'echo [%DATE% %TIME%] termine>> "{log}"\r\n'
         'del "%~f0"\r\n'
     )
     with open(bat_path, "w", encoding="utf-8") as f:
