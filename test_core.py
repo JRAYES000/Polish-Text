@@ -68,6 +68,14 @@ import inspect
 check("stream_openrouter est un générateur",
       inspect.isgeneratorfunction(main.stream_openrouter))
 
+print("== Normalisation des modificateurs (capture raccourci) ==")
+check("left alt -> alt", main._canon_mod("left alt") == "alt")
+check("right ctrl -> ctrl", main._canon_mod("right ctrl") == "ctrl")
+check("left windows -> windows", main._canon_mod("left windows") == "windows")
+check("shift -> shift", main._canon_mod("shift") == "shift")
+check("touche normale x -> None", main._canon_mod("x") is None)
+check("tab -> None (non modificateur)", main._canon_mod("tab") is None)
+
 print("== Sélection d'asset (auto-update) ==")
 _assets = [
     {"name": "TextEnhancerAI-Setup.exe", "browser_download_url": "u_setup"},

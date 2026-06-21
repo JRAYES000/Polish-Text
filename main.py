@@ -60,7 +60,7 @@ OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 # --- Version & mise à jour automatique ---------------------------------------
 # Dépôt GitHub utilisé pour les mises à jour (modifiable aussi dans
 # Paramètres → Dépôt GitHub, sans recompiler).
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.6.1"
 GITHUB_REPO = "JRAYES000/Polish-Text"
 GITHUB_API_LATEST = "https://api.github.com/repos/{repo}/releases/latest"
 
@@ -514,6 +514,52 @@ def capture_selection():
 
     # Aucune copie détectée : on garde ce qui était déjà dans le presse-papiers.
     return get_clipboard_text() or before_text
+
+
+_MOD_ORDER = ("ctrl", "alt", "shift", "windows")
+
+
+def _canon_mod(name):
+    """Nom canonique d'une touche modificatrice, ou None si non modificatrice."""
+    n = (name or "").lower()
+    if "ctrl" in n or "control" in n:
+        return "ctrl"
+    if "shift" in n:
+        return "shift"
+    if "alt" in n:
+        return "alt"
+    if "win" in n or "cmd" in n or "super" in n or "meta" in n:
+        return "windows"
+    return None
+
+
+def capture_hotkey_blocking(timeout=15):
+    """Capture UNE combinaison clavier exacte : attend la première touche NON
+    modificatrice et l'associe aux modificateurs réellement maintenus à cet
+    instant précis. Évite l'accumulation parasite (alt+tab, windows…).
+    Renvoie 'alt+x', 'ctrl+shift+e', etc., ou '' si annulé (Échap) / délai."""
+    mods = set()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            ev = keyboard.read_event(suppress=False)
+        except Exception:
+            return ""
+        if ev.event_type == keyboard.KEY_DOWN:
+            cm = _canon_mod(ev.name)
+            if cm:
+                mods.add(cm)
+            else:
+                key = (ev.name or "").lower()
+                if key in ("esc", "escape"):
+                    return ""  # annulation
+                parts = [m for m in _MOD_ORDER if m in mods] + [key]
+                return "+".join(parts)
+        elif ev.event_type == keyboard.KEY_UP:
+            cm = _canon_mod(ev.name)
+            if cm:
+                mods.discard(cm)
+    return ""
 
 
 def paste_into(target_hwnd, html=None, plain=""):
@@ -1822,12 +1868,12 @@ class SettingsWindow:
             except Exception:
                 pass
             try:
-                hk = keyboard.read_hotkey(suppress=False)
+                hk = capture_hotkey_blocking()
             except Exception:
                 hk = ""
 
             def done():
-                if hk and hk.lower() != "esc":
+                if hk and hk.lower() not in ("esc", "escape"):
                     self.hotkey_var.set(hk.lower())
                 self.capture_btn.configure(state="normal", text="Définir…")
                 self.app.reload_hotkeys()  # restaure les raccourcis enregistrés
