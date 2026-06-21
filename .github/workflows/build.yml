@@ -1,10 +1,9 @@
 name: Build Windows EXE
 
 # Déclenche la compilation :
-#  - automatiquement quand tu pousses un tag de version (ex. v1.0.1)
-#    -> publie l'exe dans une "Release" téléchargeable (utilisé par l'auto-update)
-#  - manuellement depuis l'onglet Actions (bouton "Run workflow")
-#    -> dépose l'exe en "artifact" téléchargeable
+#  - automatiquement quand tu pousses un tag de version (ex. v1.4.0)
+#    -> publie l'exe ET l'installeur dans une "Release" téléchargeable
+#  - manuellement depuis l'onglet Actions ("Run workflow") -> artifacts
 on:
   push:
     tags:
@@ -37,15 +36,29 @@ jobs:
       - name: Compiler l'exécutable
         run: pyinstaller --noconfirm --onefile --windowed --name TextEnhancerAI main.py
 
-      - name: Déposer l'exe en artifact (téléchargeable depuis Actions)
+      - name: Installer Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Compiler l'installeur
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}" -replace '^v',''
+          if ($ver -notmatch '^[0-9]') { $ver = "0.0.0" }
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$ver" installer.iss
+
+      - name: Déposer les artifacts (téléchargeables depuis Actions)
         uses: actions/upload-artifact@v4
         with:
           name: TextEnhancerAI
-          path: dist/TextEnhancerAI.exe
+          path: |
+            dist/TextEnhancerAI.exe
+            installer_output/TextEnhancerAI-Setup.exe
 
       - name: Publier dans une Release (sur tag v*)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/TextEnhancerAI.exe
+          files: |
+            dist/TextEnhancerAI.exe
+            installer_output/TextEnhancerAI-Setup.exe
           generate_release_notes: true

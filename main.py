@@ -60,7 +60,7 @@ OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 # --- Version & mise à jour automatique ---------------------------------------
 # Dépôt GitHub utilisé pour les mises à jour (modifiable aussi dans
 # Paramètres → Dépôt GitHub, sans recompiler).
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.4.0"
 GITHUB_REPO = "JRAYES000/Polish-Text"
 GITHUB_API_LATEST = "https://api.github.com/repos/{repo}/releases/latest"
 
@@ -672,12 +672,21 @@ def get_latest_release(repo, timeout=20):
         raise RuntimeError(f"GitHub {resp.status_code} : {resp.text[:200]}")
     data = resp.json()
     tag = data.get("tag_name", "")
-    asset_url = None
-    for a in data.get("assets", []):
-        if a.get("name", "").lower().endswith(".exe"):
-            asset_url = a.get("browser_download_url")
-            break
+    asset_url = _pick_update_asset(data.get("assets", []))
     return tag, asset_url, data.get("html_url")
+
+
+def _pick_update_asset(assets):
+    """Choisit l'exe autonome (pour le remplacement en place de l'auto-update),
+    jamais l'installeur (…Setup.exe)."""
+    for a in assets:
+        if a.get("name", "").lower() == "textenhancerai.exe":
+            return a.get("browser_download_url")
+    for a in assets:
+        n = a.get("name", "").lower()
+        if n.endswith(".exe") and "setup" not in n:
+            return a.get("browser_download_url")
+    return None
 
 
 def download_and_apply_update(asset_url):

@@ -68,6 +68,17 @@ import inspect
 check("stream_openrouter est un générateur",
       inspect.isgeneratorfunction(main.stream_openrouter))
 
+print("== Sélection d'asset (auto-update) ==")
+_assets = [
+    {"name": "TextEnhancerAI-Setup.exe", "browser_download_url": "u_setup"},
+    {"name": "TextEnhancerAI.exe", "browser_download_url": "u_exe"},
+]
+check("prend l'exe autonome, pas le Setup",
+      main._pick_update_asset(_assets) == "u_exe")
+check("ignore l'installeur seul",
+      main._pick_update_asset(
+          [{"name": "TextEnhancerAI-Setup.exe", "browser_download_url": "s"}]) is None)
+
 print("== Thème ==")
 check("palette claire et sombre définies",
       "light" in main.PALETTES and "dark" in main.PALETTES)
