@@ -60,7 +60,7 @@ OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 # --- Version & mise à jour automatique ---------------------------------------
 # Dépôt GitHub utilisé pour les mises à jour (modifiable aussi dans
 # Paramètres → Dépôt GitHub, sans recompiler).
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
 GITHUB_REPO = "JRAYES000/Polish-Text"
 GITHUB_API_LATEST = "https://api.github.com/repos/{repo}/releases/latest"
 
@@ -916,9 +916,14 @@ class TextEnhancerApp:
                 self.hotkey_errors.append(
                     f"« {hk} » est en double ({used[hk]} et {p['name']})")
                 continue
+            cb = (lambda name=p["name"]: self._on_preset_hotkey(name))
             try:
-                keyboard.add_hotkey(
-                    hk, lambda name=p["name"]: self._on_preset_hotkey(name))
+                # suppress=True : la combinaison n'est PAS transmise à l'appli
+                # active -> évite le « ding » du menu Alt (ex. Alt+Q).
+                try:
+                    keyboard.add_hotkey(hk, cb, suppress=True)
+                except Exception:
+                    keyboard.add_hotkey(hk, cb)  # repli sans suppression
                 used[hk] = p["name"]
                 registered += 1
             except Exception as e:
@@ -1140,6 +1145,34 @@ def compute_window_geometry(width, height, prefer_second_left=True):
     return f"{width}x{height}+{x}+{y}"
 
 
+def force_foreground(win):
+    """Amène une fenêtre Tk réellement au premier plan en UN seul appui, même
+    depuis une appli en arrière-plan (contourne le verrou de focus de Windows
+    via AttachThreadInput) — et SANS déclencher le « ding » de focus_force."""
+    try:
+        import ctypes
+        u = ctypes.windll.user32
+        k = ctypes.windll.kernel32
+        win.update_idletasks()
+        hwnd = u.GetAncestor(win.winfo_id(), 2)  # GA_ROOT
+        if not hwnd:
+            hwnd = win.winfo_id()
+        if u.IsIconic(hwnd):
+            u.ShowWindow(hwnd, 9)  # SW_RESTORE
+        fg = u.GetForegroundWindow()
+        fg_thread = u.GetWindowThreadProcessId(fg, None)
+        cur_thread = k.GetCurrentThreadId()
+        attached = False
+        if fg_thread and fg_thread != cur_thread:
+            attached = bool(u.AttachThreadInput(fg_thread, cur_thread, True))
+        u.BringWindowToTop(hwnd)
+        u.SetForegroundWindow(hwnd)
+        if attached:
+            u.AttachThreadInput(fg_thread, cur_thread, False)
+    except Exception:
+        pass
+
+
 # =============================================================================
 #  Fenêtre d'aperçu
 # =============================================================================
@@ -1161,12 +1194,11 @@ class PreviewWindow:
                 780, 640, self.cfg.get("window_second_left", True)))
         except Exception:
             self.win.geometry("780x640")
-        # Apparaît au premier plan, puis redevient une fenêtre normale : elle
-        # passe en arrière-plan dès qu'on clique ailleurs.
+        # Apparaît réellement au premier plan en un seul appui (sans « ding »),
+        # puis redevient une fenêtre normale : elle passe en arrière-plan dès
+        # qu'on clique ailleurs.
         self.win.lift()
-        self.win.focus_force()
-        self.win.attributes("-topmost", True)
-        self.win.after(400, self._release_topmost)
+        self.win.after(60, lambda: force_foreground(self.win))
 
         labels = [self._preset_label(p) for p in self.preset_items]
         init_idx = self._index_of_name(preset_name)
@@ -1332,9 +1364,7 @@ class PreviewWindow:
             pass
         try:
             self.win.lift()
-            self.win.focus_force()
-            self.win.attributes("-topmost", True)
-            self.win.after(400, self._release_topmost)
+            self.win.after(50, lambda: force_foreground(self.win))
         except Exception:
             pass
 
@@ -1536,9 +1566,7 @@ class SettingsWindow:
         self.win.configure(bg=app.palette["bg"])
         self.win.geometry("760x660")
         self.win.lift()
-        self.win.focus_force()
-        self.win.attributes("-topmost", True)
-        self.win.after(400, self._release_topmost)
+        self.win.after(60, lambda: force_foreground(self.win))
 
         nb = ttk.Notebook(self.win)
         nb.pack(fill="both", expand=True, padx=8, pady=8)
