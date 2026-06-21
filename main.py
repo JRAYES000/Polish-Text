@@ -60,7 +60,7 @@ OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 # --- Version & mise à jour automatique ---------------------------------------
 # Dépôt GitHub utilisé pour les mises à jour (modifiable aussi dans
 # Paramètres → Dépôt GitHub, sans recompiler).
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 GITHUB_REPO = "JRAYES000/Polish-Text"
 GITHUB_API_LATEST = "https://api.github.com/repos/{repo}/releases/latest"
 
@@ -469,35 +469,51 @@ def style_editor(widget):
 # =============================================================================
 #  Capture de la sélection / collage dans l'application cible
 # =============================================================================
+def _clipboard_seq():
+    """Numéro de séquence du presse-papiers (incrémenté à CHAQUE modification).
+    Permet de détecter une vraie copie même si le texte est identique."""
+    try:
+        return win32clipboard.GetClipboardSequenceNumber()
+    except Exception:
+        return None
+
+
 def capture_selection():
-    """Récupère le texte sélectionné. On tente une copie automatique (Ctrl+C) ;
-    si elle ne renvoie rien, on se rabat sur le contenu actuel du presse-papiers
-    (cas où l'utilisateur a déjà fait Ctrl+C lui-même). On ne vide JAMAIS le
-    presse-papiers, pour ne pas perdre une copie manuelle."""
+    """Copie automatiquement la sélection (Ctrl+C synthétique) et la renvoie.
+    Détecte la copie via le numéro de séquence du presse-papiers (fiable même
+    si le texte est identique). Si aucune copie n'est détectée, se rabat sur le
+    contenu actuel du presse-papiers (Ctrl+C manuel). Ne vide JAMAIS le
+    presse-papiers."""
     # Relâche les touches du raccourci pour ne pas parasiter le Ctrl+C.
     for k in ("alt", "ctrl", "shift", "windows", "q", "r", "e", "w"):
         try:
             keyboard.release(k)
         except Exception:
             pass
-    time.sleep(0.12)
+    time.sleep(0.18)  # laisse l'appli cible reprendre le focus clavier
 
-    before = get_clipboard_text()
+    before_seq = _clipboard_seq()
+    before_text = get_clipboard_text()
     try:
         keyboard.send("ctrl+c")
     except Exception:
         pass
 
-    # Attend qu'une nouvelle sélection soit copiée (jusqu'à ~1,2 s).
-    deadline = time.time() + 1.2
+    # Attend qu'une copie survienne (jusqu'à ~1,6 s).
+    deadline = time.time() + 1.6
     while time.time() < deadline:
-        time.sleep(0.08)
-        current = get_clipboard_text()
-        if current and current != before:
-            return current
+        time.sleep(0.05)
+        if before_seq is not None:
+            cur_seq = _clipboard_seq()
+            if cur_seq is not None and cur_seq != before_seq:
+                return get_clipboard_text()
+        else:
+            current = get_clipboard_text()
+            if current and current != before_text:
+                return current
 
-    # Rien de neuf : on garde ce qui était déjà dans le presse-papiers.
-    return get_clipboard_text() or before
+    # Aucune copie détectée : on garde ce qui était déjà dans le presse-papiers.
+    return get_clipboard_text() or before_text
 
 
 def paste_into(target_hwnd, html=None, plain=""):
@@ -912,16 +928,38 @@ class TextEnhancerApp:
         return self.hotkey_ok
 
     def _on_preset_hotkey(self, preset_name):
-        # Capture immédiate (l'app cible est encore au premier plan),
-        # puis on ouvre l'aperçu sur le thread Tk, présélectionné sur ce preset.
-        self.target_hwnd = win32gui.GetForegroundWindow()
-        selection = capture_selection()
-        self.root.after(0, lambda: self._open_preview(selection, preset_name))
+        # Le raccourci est pressé pendant que l'appli cible est au premier plan.
+        fg = win32gui.GetForegroundWindow()
+        self.root.after(0, lambda: self._handle_preset_hotkey(preset_name, fg))
+
+    def _handle_preset_hotkey(self, preset_name, fg):
+        pw = self.preview_win
+        # Aperçu déjà ouvert ET visible -> deuxième appui = arrière-plan (réduit).
+        if pw and pw.win.winfo_exists():
+            try:
+                visible = pw.win.state() in ("normal", "zoomed")
+            except Exception:
+                visible = True
+            if visible:
+                try:
+                    pw.win.iconify()
+                except Exception:
+                    pass
+                return
+        # Sinon : on capture la sélection (en arrière-plan pour ne pas figer
+        # l'interface) puis on ouvre / ramène l'aperçu et on génère.
+        self.target_hwnd = fg
+
+        def worker():
+            selection = capture_selection()
+            self.root.after(0, lambda: self._open_preview(selection, preset_name))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ---- Fenêtre d'aperçu ---------------------------------------------------
     def _open_preview(self, selection, preset_name=None):
         if self.preview_win and self.preview_win.win.winfo_exists():
-            self.preview_win.win.lift()
+            self.preview_win.bring_to_front()
             self.preview_win.set_source(selection, preset_name)
             return
         self.preview_win = PreviewWindow(self, selection, preset_name)
@@ -1282,6 +1320,21 @@ class PreviewWindow:
         try:
             if self.win.winfo_exists():
                 self.win.attributes("-topmost", False)
+        except Exception:
+            pass
+
+    def bring_to_front(self):
+        """Restaure la fenêtre si réduite et la ramène au premier plan."""
+        try:
+            if self.win.state() == "iconic":
+                self.win.deiconify()
+        except Exception:
+            pass
+        try:
+            self.win.lift()
+            self.win.focus_force()
+            self.win.attributes("-topmost", True)
+            self.win.after(400, self._release_topmost)
         except Exception:
             pass
 
