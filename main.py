@@ -60,7 +60,7 @@ OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 # --- Version & mise à jour automatique ---------------------------------------
 # Dépôt GitHub utilisé pour les mises à jour (modifiable aussi dans
 # Paramètres → Dépôt GitHub, sans recompiler).
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.6.0"
 GITHUB_REPO = "JRAYES000/Polish-Text"
 GITHUB_API_LATEST = "https://api.github.com/repos/{repo}/releases/latest"
 
@@ -1239,6 +1239,8 @@ class PreviewWindow:
                    command=lambda: self.paste(rich=False)).pack(side="left")
         ttk.Button(btns, text="Copier",
                    command=self.copy).pack(side="left", padx=6)
+        ttk.Button(btns, text="Effacer",
+                   command=self.clear_all).pack(side="left")
         ttk.Button(btns, text="Fermer",
                    command=self.win.destroy).pack(side="right")
 
@@ -1257,6 +1259,14 @@ class PreviewWindow:
         paned.add(res_frame, weight=1)
         self._paned = paned
 
+        src_bar = ttk.Frame(src_frame)
+        src_bar.pack(fill="x", pady=(0, 4))
+        self.edit_btn = ttk.Button(src_bar, text="Éditer le texte",
+                                   command=self._toggle_src_edit)
+        self.edit_btn.pack(side="left")
+        ttk.Label(src_bar, text="(ce texte est envoyé au modèle)",
+                  style="Muted.TLabel").pack(side="left", padx=8)
+
         swrap = ttk.Frame(src_frame)
         swrap.pack(fill="both", expand=True)
         self.src_text = tk.Text(swrap, height=4, wrap="word")
@@ -1266,8 +1276,9 @@ class PreviewWindow:
         sscroll.pack(side="right", fill="y")
         self.src_text.pack(side="left", fill="both", expand=True)
         self.src_text.insert("1.0", self.source_text)
-        self.src_text.configure(state="disabled")
         style_editor(self.src_text)
+        self.src_editable = False
+        self._set_src_editable(False)
 
         rwrap = ttk.Frame(res_frame)
         rwrap.pack(fill="both", expand=True)
@@ -1458,20 +1469,58 @@ class PreviewWindow:
         self.src_text.configure(state="normal")
         self.src_text.delete("1.0", "end")
         self.src_text.insert("1.0", self.source_text)
-        self.src_text.configure(state="disabled")
+        self._set_src_editable(False)
         if self.source_text.strip():
             self.generate()
 
+    # ---- Édition / effacement de la source ----------------------------------
+    def _set_src_editable(self, editable):
+        self.src_editable = editable
+        try:
+            self.src_text.configure(state="normal" if editable else "disabled")
+        except Exception:
+            pass
+        if hasattr(self, "edit_btn"):
+            self.edit_btn.configure(
+                text="Verrouiller l'édition" if editable else "Éditer le texte")
+        if editable:
+            try:
+                self.src_text.focus_set()
+            except Exception:
+                pass
+
+    def _toggle_src_edit(self):
+        self._set_src_editable(not getattr(self, "src_editable", False))
+        self.status_var.set("Édition du texte source activée." if self.src_editable
+                            else "Édition du texte source verrouillée.")
+
+    def clear_all(self):
+        """Vide à la fois « Texte sélectionné » et « Résultat »."""
+        for w in (self.src_text, self.result_text):
+            try:
+                w.configure(state="normal")
+                w.delete("1.0", "end")
+            except Exception:
+                pass
+        self.source_text = ""
+        # On laisse la source éditable pour saisir/coller directement un texte.
+        self._set_src_editable(True)
+        self.status_var.set("Champs effacés. Saisis ou colle un texte, puis "
+                            "« Générer ».")
+
     def generate(self):
-        if not self.source_text.strip():
+        # On lit le texte directement dans la boîte (prend en compte les
+        # éventuelles modifications de l'utilisateur).
+        src = self.src_text.get("1.0", "end-1c")
+        if not src.strip():
             self.status_var.set("Aucun texte à traiter.")
             return
+        self.source_text = src
         preset = self._current_preset()
         instruction = self.prompt_override or preset.get("instruction", "")
         preset_name = preset.get("name", "")
         model = self.model_var.get().strip() or self.cfg.get("default_model")
         api_key = self.cfg.get("api_key", "")
-        src = self.source_text
 
         self.gen_btn.configure(state="disabled")
         self.status_var.set("Génération en cours…")
